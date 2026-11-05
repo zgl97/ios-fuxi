@@ -737,8 +737,8 @@ fk_autolock(void *arg, wait_result_t wr)
 }
 
 /*
- * fuxidiag=S: S seconds after the key thread starts, dump every process (pid,
- * ppid, state, flags, name) into one kernel log block, then the threads of the
+ * fuxidiag=S: S seconds after the key thread starts, dump the process table
+ * (pid, ppid, state, flags, name) to the console, then the threads of the
  * process named by fuxidiagproc (default Preferences): tid, thread state,
  * scheduled priority, wait event and wait result. Read-only diagnostics for a
  * stuck app; device tests only.
@@ -779,7 +779,7 @@ static int
 fk_diag_cb(proc_t p, void *arg)
 {
 	const char *want = arg;
-	char line[160];
+	char line[200];
 
 	if (p->p_pid <= 1) {
 		return 0;
@@ -788,7 +788,7 @@ fk_diag_cb(proc_t p, void *arg)
 	    p->p_pid, p->p_ppid, fk_diag_stat(p->p_stat), p->p_flag, p->p_lflag,
 	    p->p_comm);
 	fk_diag_line(line);
-	if (want && want[0] && !fk_diag_pid && strncmp(p->p_comm, want, MAXCOMLEN) == 0) {
+	if (want && want[0] && fk_diag_pid == 0 && strncmp(p->p_comm, want, MAXCOMLEN) == 0) {
 		fk_diag_pid = p->p_pid;
 	}
 	return 0;
@@ -798,6 +798,7 @@ static void
 fk_diag_dump_threads(void)
 {
 	proc_t p;
+	task_t task;
 	thread_t th;
 	unsigned shown = 0;
 
@@ -810,18 +811,22 @@ fk_diag_dump_threads(void)
 		printf("FUXI DIAG: pid %d gone\n", fk_diag_pid);
 		return;
 	}
+	task = proc_get_task_raw(p);
 	printf("FUXI DIAG: pid %d comm %s threads:\n", p->p_pid, p->p_comm);
-	task_lock(p->task);
-	queue_iterate(&p->task->threads, th, thread_t, task_threads) {
-		if (shown++ >= FK_DIAG_THREADS) {
-			break;
+	if (task_lock_try(task)) {
+		queue_iterate(&task->threads, th, thread_t, task_threads) {
+			if (shown++ >= FK_DIAG_THREADS) {
+				break;
+			}
+			printf("FUXI DIAG:   tid %llu state %#x pri %d wevt %#llx wres %d cont %p\n",
+			    thread_tid(th), (unsigned)th->state, (int)th->sched_pri,
+			    (unsigned long long)th->wait_event, (int)th->wait_result,
+			    (void *)th->continuation);
 		}
-		printf("FUXI DIAG:   tid %llu state %#x pri %d wevt %#llx wres %d cont %p\n",
-		    thread_tid(th), (unsigned)th->state, (int)th->sched_pri,
-		    (unsigned long long)th->wait_event, (int)th->wait_result,
-		    (void *)th->continuation);
+		task_unlock(task);
+	} else {
+		printf("FUXI DIAG: task lock busy\n");
 	}
-	task_unlock(p->task);
 	proc_rele(p);
 }
 
@@ -855,10 +860,10 @@ fk_diag(void *arg, wait_result_t wr)
 	}
 	fk_diag_dump_threads();
 	printf("FUXI DIAG: dump end\n");
-	(void)thread_terminate(current_thread());
-	thread_block(THREAD_CONTINUE_NULL);
+	for (;;) {
+		fk_script_sleep(60000u);
+	}
 }
-
 void
 fuxi_keys_init(void)
 {
@@ -945,8 +950,7 @@ fuxi_keys_init(void)
 		if (kernel_thread_start(fk_diag, (void *)(uintptr_t)diag, &thread) == KERN_SUCCESS) {
 			thread_deallocate(thread);
 		} else {
-			printf("FUXI DIAG: thread_start failed
-");
+			printf("FUXI DIAG: thread_start failed\n");
 		}
 	}
 }
