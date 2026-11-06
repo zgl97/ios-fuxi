@@ -288,14 +288,19 @@ fk_rtc_set_clock(void)
 		printf("FUXI RTC: read failed apid=%u st=%#x\n", apid, fk_last_status);
 		return;
 	}
-	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x epoch=%u\n",
-	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs);
+	unsigned offset = 0;
+	(void)PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset));
+	uint64_t epoch = (uint64_t)secs + (uint64_t)offset;
+	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u epoch=%llu\n",
+	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset,
+	    (unsigned long long)epoch);
 	/* 2023-11 .. 2039-09: a blank or bogus RTC must not move the clock. */
-	if (secs < 1700000000u || secs > 2200000000u) {
-		printf("FUXI RTC: epoch outside sanity window; clock left alone\n");
+	if (epoch < 1700000000ull || epoch > 2200000000ull) {
+		printf("FUXI RTC: epoch %llu outside sanity window; clock left alone\n",
+		    (unsigned long long)epoch);
 		return;
 	}
-	clock_set_calendar_microtime((clock_sec_t)secs, 0);
+	clock_set_calendar_microtime((clock_sec_t)epoch, 0);
 	clock_sec_t now_s = 0;
 	clock_usec_t now_us = 0;
 	clock_get_calendar_microtime(&now_s, &now_us);
