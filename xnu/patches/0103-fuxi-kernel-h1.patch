@@ -13,15 +13,24 @@
  #include <libkern/amfi/amfi.h>
  #include <mach/kern_return.h>
  #include <sys/codesign.h>
-@@ -273,6 +279,8 @@
+@@ -263,7 +269,7 @@
+     __unused char **fatal_failure_desc, __unused size_t *fatal_failure_desc_len)
+ {
+ 	mount_t mp = vnode_mount(vp);
+-	*cs_flags |= CS_SIGNED;
++	*cs_flags |= CS_SIGNED | CS_VALID;
+ 	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
+ 	}
+@@ -272,6 +278,8 @@
+ 	}
  	return 0;
  }
- 
-+#include "fuxi_amfi.h"
 +
++#include "fuxi_amfi.h"
+ 
  /*
   * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
-  * arg). Without a policy of that name every call fails with ENOPOLICY and
 @@ -280,13 +288,14 @@
   * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
   * "profile not found"). SWEET runs without a sandbox: operations succeed
