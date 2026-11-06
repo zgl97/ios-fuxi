@@ -1628,7 +1628,7 @@
 +#endif
 --- a/bsd/dev/fuxi_gpu_scanout.inc
 +++ b/bsd/dev/fuxi_gpu_scanout.inc
-@@ -0,0 +1,2351 @@
+@@ -0,0 +1,2389 @@
 +/* SPDX-License-Identifier: MIT
 + * Copyright (c) 2026 NativeMetal contributors
 + * Ported from UniXNU drivers/NativeMetal/GpuScanoutClient.h (MIT).
@@ -1733,6 +1733,9 @@
 + * STARTed the waiting frame. The TE spin thread does not START the promoted frame while its predecessor's START is still unreported.
 + * Stats (queued, promoted, dropped, full_waits, spin_held, stale_replaced) per 600 STARTs. Not yet observed on device. */
 +static unsigned fg_scanout_fifo, fg_scanout_fifo_q, fg_scanout_fifo_buf, fg_scanout_fifo_st[6];
++/* fuxiscancpuflip=1: the panel scans a copy (B/C) while the CPU writer keeps fPixels=A; publish copies A into
++ * the back buffer and STARTs it on the TE gate, so a CPU frame is never scanned while it is written. */
++static unsigned fg_scanout_cpu_flip, fg_scanout_cpu_pending, fg_scanout_cpu_logged;
 +static unsigned fg_scanout_target(void)
 +{
 + for (unsigned i = 0; i < (fg_scanout_triple_requested ? 3u : 2u); i++)
@@ -1766,6 +1769,10 @@
 +  fg_scanout_double_requested = PE_parse_boot_argn("fuxiscandouble", &double_buffer, sizeof(double_buffer)) && double_buffer == 1;
 +  unsigned triple = PE_parse_boot_argn("fuxiscantriple", &triple_buffer, sizeof(triple_buffer)) && triple_buffer == 1;
 +  fg_scanout_triple_requested = fg_scanout_double_requested && triple;
++  unsigned cpu_flip = 0;
++  fg_scanout_cpu_flip = PE_parse_boot_argn("fuxiscancpuflip", &cpu_flip, sizeof(cpu_flip)) && cpu_flip == 1 && fg_scanout_triple_requested;
++  if (cpu_flip == 1 && !fg_scanout_cpu_flip) printf("FUXI SCANOUT: cpu flip needs fuxiscandouble=1 fuxiscantriple=1
++");
 +  fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
 +  fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
 +  unsigned early = 0;
@@ -3610,6 +3617,27 @@
 + if ((fg_scanout_ar_on() || fg_scanout_ar_state == 4) && fg_scanout_ar_disable(0, FG_AR_OFF_CPU, "cpu fallback") < 0) return -1;
 + int writable = fg_scanout_acquire(1);
 + if (writable != 1 || !fg_scanout_double_active) return writable;
++ if (fg_scanout_cpu_flip) {
++  /* CPU double buffering: keep the panel off A. Parking copies the newest image to B once; after that every
++   * publish() copies A into the buffer the panel is not scanning and flips on the TE gate. */
++  if (fg_scanout_front == 0) {
++   unsigned park = 1;
++   for (unsigned i = 0; i < 1080u*2400u; i++)
++    ((volatile uint32_t *)fg_scanout_pixels_at(park))[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
++   __asm__ volatile("dsb sy" ::: "memory");
++   if (!fg_scanout_address(fg_scanout_pa(park))) return fg_scanout_stop("cpu flip park B");
++   fg_scanout_front = park; fg_scanout_cpu_pending = 1;
++   if (!fg_scanout_cpu_logged++) printf("FUXI SCANOUT: cpu flip parked front=%u; CA keeps writing A
++", park);
++  } else if (!fg_scanout_cpu_pending) {
++   fg_scanout_cpu_pending = 1;
++  }
++  fg_scanout_copy = 0;
++  fg_scanout_writable = 1;
++  if (fg_scanout_back_ready) { fg_scanout_back_ready = 0; fg_scanout_ready_drops++; }
++  if (fg_scanout_fifo_q) fg_scanout_fifo_q = 0;
++  return 1;
++ }
 + unsigned newest = fg_scanout_fifo_q ? fg_scanout_fifo_buf : fg_scanout_back_ready ? (fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u) : fg_scanout_front;
 + if (newest >= 3 && newest < 3 + FG_DD_SLOTS_N && fg_dd_va[newest - 3]) {
 +  /* Bit 24: the newest frame is a slot's surface (retained by SweetSurface while slotted): its crop to A. */
@@ -3663,6 +3691,16 @@
 + fg_scanout_charge_to(fg_scanout_last_why); /* the last wait ran until this poll */
 + __asm__ volatile("dsb sy" ::: "memory");
 + if (!ov) fg_scanout_writable = 0;
++ if (fg_scanout_cpu_flip && fg_scanout_double_active && fg_scanout_cpu_pending) {
++  /* Copy the finished CPU frame into the buffer the panel is not scanning, then let the normal path START it. */
++  unsigned tgt = fg_scanout_triple_requested ? (fg_scanout_front == 2u ? 1u : 2u) : fg_scanout_front ^ 1u;
++  for (unsigned i = 0; i < 1080u*2400u; i++)
++   ((volatile uint32_t *)fg_scanout_pixels_at(tgt))[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
++  __asm__ volatile("dsb sy" ::: "memory");
++  fg_scanout_ready = tgt; fg_scanout_cpu_pending = 0;
++  if (fg_scanout_cpu_logged < 4) { fg_scanout_cpu_logged++; printf("FUXI SCANOUT: cpu flip %u->%u copy A->back, TE gated
++", fg_scanout_front, tgt); }
++ }
 + if (fg_scanout_double_active && !fg_scanout_select(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u))
 +  return fg_scanout_stop("double SRC0 flush");
 + if (!arm_on && !fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
