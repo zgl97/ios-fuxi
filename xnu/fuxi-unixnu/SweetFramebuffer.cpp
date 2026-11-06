@@ -195,6 +195,8 @@ public:
 	uint64_t      fNextTick;      /* next vsync deadline */
 	uint64_t      fStatCopy, fStatCopyMax, fStatStart;
 	uint32_t      fStatFrames, fStatSwaps, fStatDropped;
+	uint32_t      fPresentTrace, fPresentTraceN;
+	uint64_t      fPresentTraceLast;
 	uint32_t      fGpuFrames, fCpuFrames;
 	uint64_t      fGpuTime, fCpuTime;
 	bool          fUnixnuDiff, fUnixnuIdle, fTickArmed;
@@ -614,7 +616,15 @@ AppleCLCD::start(IOService *provider)
 	fTickArmed = true;
 	fStatStart = mach_absolute_time();
 	fVsync->wakeAtTime(kIOTimeOptionsWithLeeway, fNextTick, 0);
-	IOLog("SWEET FB: present up to %u Hz (every %u ticks)\n", 60 / fFlushTicks, fFlushTicks);
+	{
+		uint64_t tick_ns;
+		absolutetime_to_nanoseconds(fTickAbs, &tick_ns);
+		IOLog("SWEET FB: present up to %u Hz (every %u ticks, tick %llu ns)\n",
+		    60 / fFlushTicks, fFlushTicks, tick_ns);
+	}
+	PE_parse_boot_argn("fuxipresent", &fPresentTrace, sizeof(fPresentTrace));
+	fPresentTraceN = 0;
+	fPresentTraceLast = 0;
 #else
 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
 #endif
@@ -1560,6 +1570,17 @@ void AppleCLCD::presentStats(uint64_t took)
   }
   flogPrint(t1);
  }
+	if (fPresentTrace && fPresentTraceN < 1500) {
+		uint64_t now = mach_absolute_time(), now_ns, gap_ns = 0;
+		absolutetime_to_nanoseconds(now, &now_ns);
+		if (fPresentTraceLast != 0) {
+			absolutetime_to_nanoseconds(now - fPresentTraceLast, &gap_ns);
+		}
+		fPresentTraceLast = now;
+		fPresentTraceN++;
+		IOLog("SWEET FB: PRESENT n=%u t=%llu us gap=%llu us\n",
+		    fPresentTraceN, now_ns / 1000, gap_ns / 1000);
+	}
 	fStatCopy += took;
 	fStatCopyMax = took > fStatCopyMax ? took : fStatCopyMax;
 	if (++fStatFrames >= 600) {
