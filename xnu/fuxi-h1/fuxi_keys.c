@@ -62,6 +62,8 @@ bool fuxi_keys_touch_wake(void);
 #define FK_PON_PWR     0x80u
 #define FK_PON_RESIN   0x40u
 #define FK_NO_APID     0xffffu
+#define FK_RTC_PPID    0x0061u        /* SID 0, 0x61xx = PMK8550 rtc */
+#define FK_RTC_READ    0x48u          /* rtc-pm8xxx pmk8350: read 0x6148 */
 
 static vm_offset_t fk_core, fk_cnfg, fk_obs;
 static uint16_t fk_pon_apid = FK_NO_APID, fk_gpio_apid = FK_NO_APID;
@@ -232,6 +234,75 @@ fk_sleep(unsigned ms)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/* PMK8550 SID 0 rtc@6100 (qcom,pmk8350-rtc, live DT dtbo_a-0/rtc@6100):
+ * seconds are four little-endian bytes at 0x6148, per Linux rtc-pm8xxx.c
+ * (pmk8350_regs: ctrl 0x6146, write 0x6140, read 0x6148). Read only here. */
+static bool
+fk_rtc_read_raw(uint16_t apid, uint32_t *secs, uint8_t raw[4])
+{
+	uint8_t v[4];
+	for (unsigned i = 0; i < 2; ++i) {
+		if (!fk_read(apid, (uint8_t)(FK_RTC_READ + 0), &v[0]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 1), &v[1]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 2), &v[2]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 3), &v[3])) {
+			return false;
+		}
+		/* A carry can land mid-read: the LSB must not go backwards. */
+		uint8_t lsb = 0;
+		if (!fk_read(apid, FK_RTC_READ, &lsb) || lsb >= v[0]) {
+			break;
+		}
+		if (i == 1) {
+			return false;
+		}
+	}
+	raw[0] = v[0];
+	raw[1] = v[1];
+	raw[2] = v[2];
+	raw[3] = v[3];
+	*secs = (uint32_t)v[0] | ((uint32_t)v[1] << 8) |
+	    ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+	return true;
+}
+
+/* Boot-time only: the PMIC keeps this across reboots and power loss. */
+static void
+fk_rtc_set_clock(void)
+{
+	int enable = 1;
+	if (PE_parse_boot_argn("fuxirtc", &enable, sizeof(enable)) && !enable) {
+		printf("FUXI RTC: skipped (fuxirtc=0)\n");
+		return;
+	}
+	uint32_t count = fk_rd(fk_core, 4) & 0x7ffu;
+	unsigned owner = 7;
+	uint16_t apid = fk_find_apid(FK_RTC_PPID, count, &owner);
+	if (apid == FK_NO_APID) {
+		printf("FUXI RTC: no APID for PPID %#x\n", FK_RTC_PPID);
+		return;
+	}
+	uint32_t secs = 0;
+	uint8_t raw[4] = {0};
+	if (!fk_rtc_read_raw(apid, &secs, raw)) {
+		printf("FUXI RTC: read failed apid=%u st=%#x\n", apid, fk_last_status);
+		return;
+	}
+	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x epoch=%u\n",
+	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs);
+	/* 2023-11 .. 2039-09: a blank or bogus RTC must not move the clock. */
+	if (secs < 1700000000u || secs > 2200000000u) {
+		printf("FUXI RTC: epoch outside sanity window; clock left alone\n");
+		return;
+	}
+	clock_set_calendar_microtime((clock_sec_t)secs, 0);
+	clock_sec_t now_s = 0;
+	clock_usec_t now_us = 0;
+	clock_get_calendar_microtime(&now_s, &now_us);
+	printf("FUXI RTC: clock set, now=%llu.%06u\n",
+	    (unsigned long long)now_s, (unsigned)now_us);
+}
+
 static bool
 fk_setup(void)
 {
@@ -250,6 +321,7 @@ fk_setup(void)
 		    version, count);
 		return false;
 	}
+	fk_rtc_set_clock();
 	unsigned pon_owner, gpio_owner;
 	fk_pon_apid = fk_find_apid(FK_PON_PPID, count, &pon_owner);
 	fk_gpio_apid = fk_find_apid(FK_GPIO_PPID, count, &gpio_owner);
