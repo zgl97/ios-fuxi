@@ -590,8 +590,19 @@ fk_taps(void *arg, wait_result_t wr)
 		thread_block(THREAD_CONTINUE_NULL);
 		return;
 	}
-	printf("FUXI TAPS: starts in %u s: %s\n", delay, cmds);
+	unsigned loops = 1;
+	(void)PE_parse_boot_argn("fuxitapsloop", &loops, sizeof(loops));
+	if (loops < 1) {
+		loops = 1;
+	} else if (loops > 20) {
+		loops = 20;
+	}
+	printf("FUXI TAPS: starts in %u s, %u loops: %s\n", delay, loops, cmds);
 	fk_script_sleep(delay * 1000u);
+	for (unsigned pass = 0; pass < loops; pass++) {
+	if (loops > 1) {
+		printf("FUXI TAPS: loop %u/%u\n", pass + 1, loops);
+	}
 	p = cmds;
 	while (*p) {
 		long v[5];
@@ -641,7 +652,8 @@ fk_taps(void *arg, wait_result_t wr)
 			printf("FUXI TAPS: bad command '%c' with %d numbers\n", op, n);
 		}
 	}
-	printf("FUXI TAPS: done, %u shots\n", shots);
+	}
+	printf("FUXI TAPS: done, %u shots, %u loops\n", shots, loops);
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
