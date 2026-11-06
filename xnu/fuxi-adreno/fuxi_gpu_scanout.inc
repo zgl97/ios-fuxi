@@ -140,8 +140,7 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
   unsigned cpu_flip = 0;
   fg_scanout_cpu_flip = PE_parse_boot_argn("fuxiscancpuflip", &cpu_flip, sizeof(cpu_flip)) && cpu_flip == 1 && fg_scanout_triple_requested;
-  if (cpu_flip == 1 && !fg_scanout_cpu_flip) printf("FUXI SCANOUT: cpu flip needs fuxiscandouble=1 fuxiscantriple=1
-");
+  if (cpu_flip == 1 && !fg_scanout_cpu_flip) printf("FUXI SCANOUT: cpu flip needs fuxiscandouble=1 fuxiscantriple=1\n");
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
   unsigned early = 0;
@@ -1996,8 +1995,7 @@ int fuxi_gpu_scanout_cpu_acquire(void)
    __asm__ volatile("dsb sy" ::: "memory");
    if (!fg_scanout_address(fg_scanout_pa(park))) return fg_scanout_stop("cpu flip park B");
    fg_scanout_front = park; fg_scanout_cpu_pending = 1;
-   if (!fg_scanout_cpu_logged++) printf("FUXI SCANOUT: cpu flip parked front=%u; CA keeps writing A
-", park);
+   if (!fg_scanout_cpu_logged++) printf("FUXI SCANOUT: cpu flip parked front=%u; CA keeps writing A\n", park);
   } else if (!fg_scanout_cpu_pending) {
    fg_scanout_cpu_pending = 1;
   }
@@ -2067,8 +2065,7 @@ static int fg_scanout_publish(void)
    ((volatile uint32_t *)fg_scanout_pixels_at(tgt))[i] = ((const volatile uint32_t *)fg_scanout_pixels)[i];
   __asm__ volatile("dsb sy" ::: "memory");
   fg_scanout_ready = tgt; fg_scanout_cpu_pending = 0;
-  if (fg_scanout_cpu_logged < 4) { fg_scanout_cpu_logged++; printf("FUXI SCANOUT: cpu flip %u->%u copy A->back, TE gated
-", fg_scanout_front, tgt); }
+  if (fg_scanout_cpu_logged < 4) { fg_scanout_cpu_logged++; printf("FUXI SCANOUT: cpu flip %u->%u copy A->back, TE gated\n", fg_scanout_front, tgt); }
  }
  if (fg_scanout_double_active && !fg_scanout_select(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u))
   return fg_scanout_stop("double SRC0 flush");
