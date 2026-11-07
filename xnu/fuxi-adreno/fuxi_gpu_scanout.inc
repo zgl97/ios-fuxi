@@ -140,6 +140,8 @@ void fuxi_gpu_scanout_configure(uintptr_t pixels, unsigned enabled, unsigned che
   fg_scanout_triple_requested = fg_scanout_double_requested && triple;
   unsigned cpu_flip = 0;
   fg_scanout_cpu_flip = PE_parse_boot_argn("fuxiscancpuflip", &cpu_flip, sizeof(cpu_flip)) && cpu_flip == 1 && fg_scanout_triple_requested;
+  unsigned flip_log = 0;
+  fg_scanout_flip_log = PE_parse_boot_argn("fuxiscanfliplog", &flip_log, sizeof(flip_log)) && flip_log == 1;
   if (cpu_flip == 1 && !fg_scanout_cpu_flip) printf("FUXI SCANOUT: cpu flip needs fuxiscandouble=1 fuxiscantriple=1\n");
   fg_scanout_panel120_requested = PE_parse_boot_argn("fuxipanel120", &panel120, sizeof(panel120)) && panel120 == 1;
   fg_scanout_te_mode = PE_parse_boot_argn("fuxiscante", &te, sizeof(te)) && te == 1;
@@ -794,8 +796,11 @@ static void fg_scanout_arm(unsigned count)
 }
 static int fg_dpu_geometry(const unsigned g[4]);
 /* Preserve other pending flush bits; VIG0 is CTL_FLUSH bit0. After a direct slot (bit 24) A's geometry comes back with the address. */
+static unsigned fg_scanout_flip_log, fg_scanout_flip_addr_logged, fg_scanout_flip_pick_logged;
 static int fg_scanout_address(unsigned pa)
 {
+ if (fg_scanout_flip_log && fg_scanout_flip_addr_logged++ < 12) printf("FUXI SCANOUT: addr %#x
+", pa);
  unsigned flush;
  if (fg_dd_geo) {
   unsigned g[4] = {fg_dd_ga[0], fg_dd_ga[1], fg_dd_ga[2], pa};
@@ -2069,6 +2074,12 @@ static int fg_scanout_publish(void)
  }
  if (fg_scanout_double_active && !fg_scanout_select(fg_scanout_triple_requested ? fg_scanout_ready : fg_scanout_front ^ 1u))
   return fg_scanout_stop("double SRC0 flush");
+ if (fg_scanout_flip_log && fg_scanout_flip_pick_logged++ < 12) {
+  unsigned pick_src = 0;
+  (void)fg_scanout_read(0xae05014, &pick_src);
+  printf("FUXI SCANOUT: pick front %u ready %u src %#x
+", fg_scanout_front, fg_scanout_ready, pick_src);
+ }
  if (!arm_on && !fg_scanout_write(FG_SCAN_CTL+0x1c, 1)) return fg_scanout_stop("start transfer");
  fg_scanout_probe_t0 = rsr("cntpct_el0");
  fg_scanout_stamps.previous_start = fg_scanout_stamps.start;
