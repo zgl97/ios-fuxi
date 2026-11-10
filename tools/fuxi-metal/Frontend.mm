@@ -1104,7 +1104,7 @@ static uint64_t refreshCommandShadows(FuxiCommandBuffer *command){
  [self active];if(!bytes || !n || n>4096 || i>=fuxi::resourceSlots)invalid(@"inline bytes bound");
  try {
   owner(_command->_queue->_device)->backend->requireLive();
-  auto slice=_command->_uploads.copy(bytes,n,_command->_queue->_uploadStorage,[&](size_t capacity){
+  auto slice=_command->_uploads.copyOffsetZero(bytes,n,_command->_queue->_uploadStorage,[&](size_t capacity){
    FuxiBuffer *b=[FuxiBuffer new];b->_device=[_command->_queue->_device retain];
    try{b->_buffer=owner(b->_device)->backend->allocate(capacity);b->_buffer->upload=true;}catch(...){[b release];throw;}return b;
   },[](FuxiBuffer *b){return b->_buffer->contents;});
