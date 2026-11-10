@@ -16,6 +16,13 @@ import zlib
 import usb.core
 import usb.util
 
+try:
+    import libusb_package
+    import usb.backend.libusb1
+    usb_backend = usb.backend.libusb1.get_backend(find_library=libusb_package.find_library)
+except Exception:
+    usb_backend = None
+
 MON_FIELDS = 'magic delegate active usb_mpidr launch stage boot_args entry deadline image end'.split()
 WANTED = {'_fuxi_early_status', '_sweet_log_ring', '_sweet_log_total'}
 OPTIONAL = {'_sweet_log_size'}  # xnu27 fuxi/0006: ring size (absent: the 4 MiB xnu-8796 ring)
@@ -190,15 +197,28 @@ def main():
     offsets = {name: value - virt for name, value in symbols(args.kernel).items()}
     if any(not 0 <= off < size - RING_DEFAULT for off in offsets.values()):
         ap.error('symbol outside XNU window')
-    devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001))
+    devices = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001, backend=usb_backend))
     devices = [d for d in devices if usb.util.get_string(d, d.iProduct) == 'Fuxi hardware probe']
     if len(devices) != 1:
         ap.error('expected exactly one Fuxi native monitor')
+    state = {'dev': devices[0]}
     dev = devices[0]
+
+    def reconnect():
+        for _ in range(120):
+            try:
+                ds = list(usb.core.find(find_all=True, idVendor=0x1209, idProduct=0x0001, backend=usb_backend))
+            except usb.core.USBError:
+                ds = []
+            if ds:
+                state['dev'] = ds[0]
+                return True
+            time.sleep(0.5)
+        return False
     args.out.mkdir(parents=True, exist_ok=False)
 
     def request(number, length, value=0, index=0, timeout=3000):
-        data = bytes(dev.ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
+        data = bytes(state['dev'].ctrl_transfer(0xc0, number, value, index, length, timeout=timeout))
         if len(data) != length:
             raise ValueError(f'short USB response: {number:#x}')
         return data
@@ -363,6 +383,11 @@ def main():
     until = time.monotonic() + args.seconds
     renew = time.monotonic() + 600
     def save_framebuffer(name):
+        try:
+            save_framebuffer_raw(name)
+        except usb.core.USBError as exc:
+            print('framebuffer read failed:', exc, flush=True)
+    def save_framebuffer_raw(name):
         raw=bytearray()
         for off in range(0,1080*2400*4,512):
             raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
@@ -381,8 +406,18 @@ def main():
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done, ring = b'', set(), None
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
+        reconnects = 0
         while time.monotonic() < until:
-            status = monitor()
+            try:
+                status = monitor()
+            except usb.core.USBError as e:
+                print('usb lost (%s); reconnecting' % e, flush=True)
+                if not reconnect():
+                    raise SystemExit('device did not come back')
+                reconnects += 1
+                print('reconnected #%d' % reconnects, flush=True)
+                time.sleep(1.0)
+                continue
             if status['stage'] == 99:
                 status['error'] = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
             if status['stage'] >= 8 and status['stage'] != 99:
@@ -405,7 +440,9 @@ def main():
                     length = min(total-start, ring-index)
                     data = read_ram(offsets['_sweet_log_ring']+index, length)
                     log.write(data)
-                    tour_tail = (tour_tail+data)[-4096:] if args.tour_shots else b''
+                    # Keep a wide window: crash-spam daemons can flood the ring
+                    # between two tour markers and would otherwise hide them.
+                    tour_tail = (tour_tail+data)[-262144:] if args.tour_shots else b''
                     start += length
                 log.flush()
                 last_total = total
