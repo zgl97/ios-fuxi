@@ -31,6 +31,8 @@
 #include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/kauth.h>
+#include <sys/codesign.h>
+#include <sys/proc_internal.h>
 #include <sys/sysctl.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -39,6 +41,12 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <vm/vm_kern.h>
+#include <vm/pmap.h>
+#include <sys/vnode.h>
+#include <sys/namei.h>
+#include <sys/uio.h>
+#include <sys/vfs_context.h>
 #include "sweet_spmi_bus.h"
 #include "fuxi_key_state.h"
 
@@ -48,6 +56,10 @@ extern void sweet_hid_key_at(int key, int down, uint64_t timestamp);
 extern int sweet_hid_touch_mode(void);
 extern void fuxi_perf_input(void);
 void fuxi_keys_init(void);
+void fuxi_wifi_probe_init(void); /* fuxiwifiprobe: WiFi stage 1 read-only, stage 2 rails */
+static unsigned tccdiag;
+static void fk_tccdiag(void *arg, wait_result_t wr);
+static void fk_tccdiag_probe(proc_t p);
 bool fuxi_keys_touch_wake(void);
 
 #define FK_CORE_PA     0x0c400000u
@@ -62,6 +74,8 @@ bool fuxi_keys_touch_wake(void);
 #define FK_PON_PWR     0x80u
 #define FK_PON_RESIN   0x40u
 #define FK_NO_APID     0xffffu
+#define FK_RTC_PPID    0x0061u        /* SID 0, 0x61xx = PMK8550 rtc */
+#define FK_RTC_READ    0x48u          /* rtc-pm8xxx pmk8350: read 0x6148 */
 
 static vm_offset_t fk_core, fk_cnfg, fk_obs;
 static uint16_t fk_pon_apid = FK_NO_APID, fk_gpio_apid = FK_NO_APID;
@@ -232,6 +246,80 @@ fk_sleep(unsigned ms)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+/* PMK8550 SID 0 rtc@6100 (qcom,pmk8350-rtc, live DT dtbo_a-0/rtc@6100):
+ * seconds are four little-endian bytes at 0x6148, per Linux rtc-pm8xxx.c
+ * (pmk8350_regs: ctrl 0x6146, write 0x6140, read 0x6148). Read only here. */
+static bool
+fk_rtc_read_raw(uint16_t apid, uint32_t *secs, uint8_t raw[4])
+{
+	uint8_t v[4];
+	for (unsigned i = 0; i < 2; ++i) {
+		if (!fk_read(apid, (uint8_t)(FK_RTC_READ + 0), &v[0]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 1), &v[1]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 2), &v[2]) ||
+		    !fk_read(apid, (uint8_t)(FK_RTC_READ + 3), &v[3])) {
+			return false;
+		}
+		/* A carry can land mid-read: the LSB must not go backwards. */
+		uint8_t lsb = 0;
+		if (!fk_read(apid, FK_RTC_READ, &lsb) || lsb >= v[0]) {
+			break;
+		}
+		if (i == 1) {
+			return false;
+		}
+	}
+	raw[0] = v[0];
+	raw[1] = v[1];
+	raw[2] = v[2];
+	raw[3] = v[3];
+	*secs = (uint32_t)v[0] | ((uint32_t)v[1] << 8) |
+	    ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
+	return true;
+}
+
+/* Boot-time only: the PMIC keeps this across reboots and power loss. */
+static void
+fk_rtc_set_clock(void)
+{
+	int enable = 1;
+	if (PE_parse_boot_argn("fuxirtc", &enable, sizeof(enable)) && !enable) {
+		printf("FUXI RTC: skipped (fuxirtc=0)\n");
+		return;
+	}
+	uint32_t count = fk_rd(fk_core, 4) & 0x7ffu;
+	unsigned owner = 7;
+	uint16_t apid = fk_find_apid(FK_RTC_PPID, count, &owner);
+	if (apid == FK_NO_APID) {
+		printf("FUXI RTC: no APID for PPID %#x\n", FK_RTC_PPID);
+		return;
+	}
+	uint32_t secs = 0;
+	uint8_t raw[4] = {0};
+	if (!fk_rtc_read_raw(apid, &secs, raw)) {
+		printf("FUXI RTC: read failed apid=%u st=%#x\n", apid, fk_last_status);
+		return;
+	}
+	unsigned offset = 0;
+	(void)PE_parse_boot_argn("fuxirtcoffset", &offset, sizeof(offset));
+	uint64_t epoch = (uint64_t)secs + (uint64_t)offset;
+	printf("FUXI RTC: apid=%u/ee%u raw %02x %02x %02x %02x counter=%u offset=%u epoch=%llu\n",
+	    apid, owner, raw[0], raw[1], raw[2], raw[3], secs, offset,
+	    (unsigned long long)epoch);
+	/* 2023-11 .. 2039-09: a blank or bogus RTC must not move the clock. */
+	if (epoch < 1700000000ull || epoch > 2200000000ull) {
+		printf("FUXI RTC: epoch %llu outside sanity window; clock left alone\n",
+		    (unsigned long long)epoch);
+		return;
+	}
+	clock_set_calendar_microtime((clock_sec_t)epoch, 0);
+	clock_sec_t now_s = 0;
+	clock_usec_t now_us = 0;
+	clock_get_calendar_microtime(&now_s, &now_us);
+	printf("FUXI RTC: clock set, now=%llu.%06u\n",
+	    (unsigned long long)now_s, (unsigned)now_us);
+}
+
 static bool
 fk_setup(void)
 {
@@ -250,6 +338,7 @@ fk_setup(void)
 		    version, count);
 		return false;
 	}
+	fk_rtc_set_clock();
 	unsigned pon_owner, gpio_owner;
 	fk_pon_apid = fk_find_apid(FK_PON_PPID, count, &pon_owner);
 	fk_gpio_apid = fk_find_apid(FK_GPIO_PPID, count, &gpio_owner);
@@ -461,6 +550,122 @@ fk_touch_script(void *arg, wait_result_t wr)
 		printf("FUXI TOUCH SCRIPT: loop %u done\n", loop);
 	}
 	printf("FUXI TOUCH SCRIPT: done\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
+ * fuxitaps=S: S seconds after the key thread starts, run the explicit command
+ * list in fuxitapcmd=STR through the same synthetic touch/key path, so a
+ * remote operator can drive the UI at exact coordinates. Commands are
+ * separated by ';': tX,Y tap, sX0,Y0,X1,Y1,MS swipe, wMS wait, kP key click
+ * (0 power, 1 volume-up, 2 volume-down) and pMS wait then screenshot. Each
+ * screenshot prints "FUXI TOUR: shot N step" so tools/fuxi-xnu-monitor.py
+ * --tour-shots saves the framebuffer at that point. Coordinates are in the
+ * 1080x2400 panel space. Device tests only (synthetic touches, finger 0).
+ */
+static const char *
+fk_taps_nums(const char *p, long *out, int max, int *count)
+{
+	int n = 0;
+
+	while (n < max) {
+		long v = 0;
+		while (*p == ',' || *p == ' ') {
+			p++;
+		}
+		if (*p < '0' || *p > '9') {
+			break;
+		}
+		while (*p >= '0' && *p <= '9') {
+			v = v * 10 + (*p - '0');
+			p++;
+		}
+		out[n++] = v;
+	}
+	*count = n;
+	return p;
+}
+
+static void
+fk_taps(void *arg, wait_result_t wr)
+{
+	unsigned delay = (unsigned)(uintptr_t)arg;
+	unsigned shots = 0;
+	const char *p;
+	char cmds[400];
+
+	(void)wr;
+	if (!PE_parse_boot_argn("fuxitapcmd", cmds, sizeof(cmds))) {
+		printf("FUXI TAPS: fuxitapcmd missing\n");
+		(void)thread_terminate(current_thread());
+		thread_block(THREAD_CONTINUE_NULL);
+		return;
+	}
+	unsigned loops = 1;
+	(void)PE_parse_boot_argn("fuxitapsloop", &loops, sizeof(loops));
+	if (loops < 1) {
+		loops = 1;
+	} else if (loops > 20) {
+		loops = 20;
+	}
+	printf("FUXI TAPS: starts in %u s, %u loops: %s\n", delay, loops, cmds);
+	fk_script_sleep(delay * 1000u);
+	for (unsigned pass = 0; pass < loops; pass++) {
+	if (loops > 1) {
+		printf("FUXI TAPS: loop %u/%u\n", pass + 1, loops);
+	}
+	p = cmds;
+	while (*p) {
+		long v[5];
+		int n = 0;
+		char op;
+		while (*p == ';' || *p == ' ') {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		op = *p++;
+		p = fk_taps_nums(p, v, 5, &n);
+		while (*p && *p != ';') {
+			p++;
+		}
+		if (op == 't' && n >= 2) {
+			printf("FUXI TAPS: tap %ld,%ld\n", v[0], v[1]);
+			fuxi_perf_input();
+			sweet_hid_touch(0, 1, (int)v[0], (int)v[1]);
+			fk_script_sleep(80);
+			sweet_hid_touch(0, 0, (int)v[0], (int)v[1]);
+			fk_script_sleep(1200);
+			printf("FUXI TOUR: shot %u step\n", ++shots);
+		} else if (op == 's' && n >= 4) {
+			printf("FUXI TAPS: swipe %ld,%ld -> %ld,%ld in %ld ms\n", v[0], v[1], v[2], v[3],
+			    n >= 5 ? v[4] : 250);
+			fk_swipe((int)v[0], (int)v[1], (int)v[2], (int)v[3],
+			    n >= 5 ? (unsigned)v[4] : 250u);
+			fk_script_sleep(1200);
+			printf("FUXI TOUR: shot %u step\n", ++shots);
+		} else if (op == 'w' && n >= 1) {
+			printf("FUXI TAPS: wait %ld ms\n", v[0]);
+			fk_script_sleep((unsigned)v[0]);
+		} else if (op == 'p' && n >= 1) {
+			printf("FUXI TAPS: shot after %ld ms\n", v[0]);
+			fk_script_sleep((unsigned)v[0]);
+			printf("FUXI TOUR: shot %u step\n", ++shots);
+		} else if (op == 'k' && n >= 1) {
+			struct fuxi_key_inject cmd = {(unsigned)v[0], FUXI_KEY_INJECT_CLICK, 120};
+			printf("FUXI TAPS: key %ld %s\n", v[0],
+			    v[0] == 0 ? "power" : v[0] == 1 ? "volume-up" :
+			    v[0] == 2 ? "volume-down" : "");
+			(void)fk_inject(&cmd);
+			fk_script_sleep(1200);
+		} else {
+			printf("FUXI TAPS: bad command '%c' with %d numbers\n", op, n);
+		}
+	}
+	}
+	printf("FUXI TAPS: done, %u shots, %u loops\n", shots, loops);
 	(void)thread_terminate(current_thread());
 	thread_block(THREAD_CONTINUE_NULL);
 }
@@ -701,6 +906,77 @@ fuxi_keys_init(void)
 			printf("FUXI TOUCH SCRIPT: thread_start failed\n");
 		}
 	}
+	unsigned taps = 0;
+	if (PE_parse_boot_argn("fuxitccdiag", &tccdiag, sizeof(tccdiag)) &&
+	    tccdiag > 0 && tccdiag < 3600) {
+		if (kernel_thread_start(fk_tccdiag, (void *)(uintptr_t)tccdiag, &thread) ==
+		    KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI TCC: thread_start failed\n");
+		}
+	}
+	if (PE_parse_boot_argn("fuxitaps", &taps, sizeof(taps)) && taps > 0 && taps < 3600) {
+		if (kernel_thread_start(fk_taps, (void *)(uintptr_t)taps, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI TAPS: thread_start failed\n");
+		}
+	}
+	fuxi_wifi_probe_init();
+}
+/*
+ * fuxitccdiag=S: S seconds after init, print what the kernel can see about the
+ * code signing state of the processes that decide TCC answers. Evidence only.
+ */
+static const char *fk_tccdiag_want[] = {
+	"assetsd", "tccd", "SpringBoard", "launchd", "MobileSlideShow", "photolibraryd"
+};
+
+static void
+fk_tccdiag_probe(proc_t p)
+{
+	const char *n = p->p_comm;
+	if (!n) {
+		return;
+	}
+	void *blob = NULL;
+	size_t len = 0;
+	int rc = cs_entitlements_blob_get(p, &blob, &len);
+	printf("FUXI TCC: pid %d %s flags %#x ent rc=%d len=%lu blob=%p\n",
+	    p->p_pid, n, proc_getcsflags(p), rc, (unsigned long)len, blob);
+}
+
+static void
+fk_tccdiag(void *arg, wait_result_t wr)
+{
+	uintptr_t when = (uintptr_t)arg;
+	(void)wr;
+	fk_script_sleep((uint32_t)when * 1000u);
+	printf("FUXI TCC: dump at %lu s\n", (unsigned long)when);
+	unsigned found = 0, seen = 0;
+	for (int pid = 1; pid <= 400; pid++) {
+		proc_t p = proc_find(pid);
+		if (p == PROC_NULL || p == NULL) {
+			continue;
+		}
+		seen++;
+		const char *n = p->p_comm;
+		if (seen <= 10 && n) {
+			printf("FUXI TCC: scan pid %d comm '%s'\n", pid, n);
+		}
+		if (n) {
+			for (unsigned i = 0; i < sizeof(fk_tccdiag_want) / sizeof(fk_tccdiag_want[0]); i++) {
+				if (strcmp(n, fk_tccdiag_want[i]) == 0) {
+					fk_tccdiag_probe(p);
+					found++;
+					break;
+				}
+			}
+		}
+		proc_rele(p);
+	}
+	printf("FUXI TCC: done, seen %u procs, matched %u\n", seen, found);
 }
 /* Injected downs are released at the latest FUXI_KEY_INJECT_HOLD_MAX_MS later. */
 static void
@@ -861,5 +1137,1183 @@ fuxi_keys_touch_wake(void)
 		printf("FUXI KEYS: tap-to-wake power click (touch mode %#x)\n", mode);
 	}
 	return go;
+}
+
+/*
+ * WiFi bring-up probe (boot-arg fuxiwifiprobe=STAGE), read-only except stage 2.
+ *
+ * Hardware from the live DT (build/live.dtb) and docs-lanes:
+ *   GCC 0x100000, PCIe0 PARF 0x1c00000, PHY 0x1c06000, DBI 0x60000000,
+ *   pinctrl@f000000; apps_rsc DRV2 0x17a20000 (tcs-offset 0xd00),
+ *   AOP cmd-db 0x81c60000 (0x20000); PMICs PM8550/PM8550VS/PM8550VE.
+ *   WLAN_EN GPIO 80, SW_CTRL GPIO 82, PERST# GPIO 94 (active low).
+ * The register map, the rail list and the request format come from
+ * UniXNU-sheng package/{WifiProbe,QcomRpmh,WcnPower} (BSD-2-Clause-Patent).
+ *
+ *   stage 1  GCC votes, PCIe0 GDSC and the branch halt registers (read only)
+ *   stage 2  stage 1 + vote the six WCN7850 rails ON through the apps RSC,
+ *            then read the GCC state again (writes: RPMh rail votes only)
+ *   stage 3  reserved for WLAN_EN/PERST#/GDSC/PCIe training
+ * Nothing else writes a register. A block that is not clocked is never read:
+ * the PCIe controller registers only after the GDSC is on and the four
+ * required branches run.
+ */
+#define FW_GCC		0x00100000ULL
+#define FW_PARF		0x01c00000ULL
+#define FW_CFG_WIN	0x60100000ULL
+#define FW_DBI		0x60000000ULL
+#define FW_RSC		0x17a20000ULL
+#define FW_CMDD_B	0x81c60000ULL
+#define FW_CMDD_SZ	0x20000u
+#define FW_TCS		0xd00u
+#define FW_VOTE8	0x52008u
+#define FW_VOTE0	0x52000u
+#define FW_GDSC		0x6b004u
+#define FW_PARF_LTSSM	0x1b0u
+#define FW_PARF_PHYCTL	0x40u
+#define FW_LINK_CONTROL	0x80u
+
+#define FW_MSGID_WR	(8u | (1u << 8) | (1u << 16))
+#define FW_CTL_ACTIVE	(1u << 16)
+#define FW_CTL_TRIGGER	(1u << 24)
+#define FW_DB_MAGIC	0x0c0330dbu
+#define FW_TLMM	0x0f100000ULL
+#define FW_TLMM_SZ	0x60000u
+#define FW_GCC_SZ	0x80000u
+#define FW_WLAN_EN	80u
+#define FW_CLKREQ	95u
+#define FW_PERST	94u
+#define FW_PHY		0x01c06000ULL
+#define FW_PHY_SZ	0x2000u
+#define FW_ATU		0x60001000ULL
+#define FW_CONFIG	0x60100000ULL
+#define FW_TCSR		0x1fd5000ULL
+#define FW_AUXRCG	0x6b074u
+#define FW_RCHNGRCG	0x6b058u
+#define FW_PIPEMUX	0x6b070u
+#define FW_PCIEBRC	0x6b000u
+#define FW_PHYBRC	0x6c01cu
+#define FW_COLLAPSE	0x52020u
+#define FW_PHYGDSC	0x6c000u
+#define FW_VOTE8B	0x7fu
+#define FW_VOTE0B	((1u << 12) | (1u << 19) | (1u << 22))
+#define FW_MEMBASE	0x60300000u
+#define FW_MEMSIZE	0x3d00000u
+#define FW_MHI_SZ	0x200000u
+#define FW_IOVA	0x61000000u
+#define FW_PARF_SZ	0x3000u
+#define FW_DBI		0x60000000ULL
+#define FW_DBI_SZ	0x1000u
+
+struct fw_rail {
+	const char *name;
+	uint32_t millivolts;
+};
+
+/* WCN7850 PMU supplies, in the order the power sequencer takes them. */
+static const struct fw_rail fw_rails[] = {
+	{ "smpg5", 850 }, { "ldob15", 1800 }, { "smpg2", 850 },
+	{ "smpe4", 950 }, { "smpg4", 1300 }, { "smpg6", 1860 },
+};
+
+struct fw_rsc_layout {
+	uint32_t tcs_stride, cmd_stride, irq_status, irq_clear, wait_for_cmpl,
+	    control, status, cmd_enable, cmd_msgid, cmd_addr, cmd_data;
+};
+
+static uint32_t fw_stage;
+static vm_offset_t fw_smmu_win;
+static uint32_t fw_bar0_saved, fw_cmd_saved;
+extern uint64_t kvtophys(vm_offset_t va);
+static void fw_mhi_contexts(volatile uint32_t *m, uint8_t *base, uint64_t iova);
+static uint32_t fw_link_recover(volatile uint32_t *cfg, uint32_t bar0, uint32_t cmd);
+static uint32_t fw_bhi_addr;
+static vm_offset_t bar0;
+static void fw_atu_dump(volatile uint32_t *);
+static void fw_smmu_dump(void);
+static volatile uint32_t *fw_atu_ptr;
+static volatile uint32_t *fw_dbi_ptr;
+static void fw_bhi_boot(volatile uint32_t *);
+static uint32_t fw_read_file(const char *, vm_offset_t, uint32_t);
+
+static void fw_mhi_probe(volatile uint32_t *patu, volatile uint32_t *pcfg, volatile uint32_t *pdbi);
+static void fw_mhi_regs(volatile uint32_t *m, uint32_t span);
+
+static const uint32_t fw_branches[] = {
+	0x6b020, 0x6b02c, 0x6b038, 0x6b03c, 0x6b048,
+	0x6b01c, 0x10030, 0x1003c, 0x1004c, 0x6b054,
+};
+
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+static struct fw_rsc_layout
+fw_layout(uint32_t drv_id)
+{
+	struct fw_rsc_layout v3 = { 672, 24, 0x04, 0x08, 0x20, 0x24, 0x28,
+		0x2c, 0x34, 0x38, 0x3c };
+	struct fw_rsc_layout v2 = { 672, 20, 0x04, 0x08, 0x10, 0x14, 0x18,
+		0x1c, 0x30, 0x34, 0x38 };
+	return ((drv_id >> 16) & 0xffu) >= 3u ? v3 : v2;
+}
+
+static uint16_t
+fw_le16(const uint8_t *p)
+{
+	return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t
+fw_le32(const uint8_t *p)
+{
+	return (uint32_t)fw_le16(p) | ((uint32_t)fw_le16(p + 2) << 16);
+}
+
+/* AOP command database: header, then 8 slave records, then the entries the
+ * offsets count from (byte 144). Entries are 24 bytes with an 8-byte name. */
+static int
+fw_db_find(const uint8_t *db, size_t bytes, const char *name, uint32_t *address)
+{
+	char id[8] = { 0 };
+	unsigned s, i;
+
+	if (bytes < 144 || fw_le32(db + 4) != FW_DB_MAGIC) {
+		return -1;
+	}
+	for (i = 0; i < 8 && name[i]; i++) {
+		id[i] = name[i];
+	}
+	for (s = 0; s < 8; s++) {
+		const uint8_t *slave = db + 8 + 16 * s;
+		uint32_t heads, count, e;
+
+		if (!fw_le16(slave)) {
+			break;
+		}
+		heads = 144u + fw_le16(slave + 2);
+		count = fw_le16(slave + 6);
+		if ((size_t)heads + (size_t)count * 24 > bytes) {
+			return -1;
+		}
+		for (e = 0; e < count; e++) {
+			const uint8_t *entry = db + heads + 24 * e;
+			unsigned same = 1;
+
+			for (i = 0; i < 8 && same; i++) {
+				same = entry[i] == (uint8_t)id[i];
+			}
+			if (!same) {
+				continue;
+			}
+			*address = fw_le32(entry + 16);
+			return *address ? 0 : -1;
+		}
+	}
+	return -1;
+}
+
+/* One active-only request of a single command in TCS 0, applied in order and
+ * released after two milliseconds (the RSC's done latch reads zero here, as
+ * sheng found with the same firmware). */
+static void
+fw_rpmh_send(volatile uint32_t *r, const struct fw_rsc_layout *l, uint32_t addr,
+    uint32_t value)
+{
+	const uint32_t b = FW_TCS + l->tcs_stride * 0;
+	const uint32_t cmd = b + l->cmd_stride * 0;
+
+	r[(b + l->control) / 4] = 0;
+	r[(b + l->irq_clear) / 4] = 1u << 0;
+	r[(cmd + l->cmd_msgid) / 4] = FW_MSGID_WR;
+	r[(cmd + l->cmd_addr) / 4] = addr;
+	r[(cmd + l->cmd_data) / 4] = value;
+	r[(b + l->wait_for_cmpl) / 4] = 1u;
+	r[(b + l->cmd_enable) / 4] = 1u;
+	r[(b + l->control) / 4] = FW_CTL_ACTIVE;
+	__asm__ volatile("dsb sy" ::: "memory");
+	r[(b + l->control) / 4] = FW_CTL_ACTIVE | FW_CTL_TRIGGER;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	delay(2000);
+
+	r[(b + l->irq_clear) / 4] = 1u << 0;
+	r[(b + l->control) / 4] = 0;
+	r[(b + l->cmd_enable) / 4] = 0;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void
+fw_read_gcc(const char *tag)
+{
+	volatile uint32_t *gcc;
+	uint32_t vote8, vote0, gdsc, halt = 0;
+	unsigned i;
+
+	gcc = (volatile uint32_t *)ml_io_map(FW_GCC, 0x80000);
+	if (!gcc) {
+		printf("FUXI WIFI: %s gcc map failed\n", tag);
+		return;
+	}
+	vote8 = gcc[FW_VOTE8 / 4u];
+	vote0 = gcc[FW_VOTE0 / 4u];
+	gdsc = gcc[FW_GDSC / 4u];
+	for (i = 0; i < sizeof fw_branches / sizeof fw_branches[0]; i++) {
+		if (gcc[fw_branches[i] / 4u] & (1u << 31)) {
+			halt |= 1u << i;
+		}
+	}
+	printf("FUXI WIFI: %s gcc vote8 %#x vote0 %#x gdsc %#x halt %#x\n",
+	    tag, vote8, vote0, gdsc, halt);
+}
+
+static void
+fw_power_rails(void)
+{
+	volatile uint32_t *r;
+	const uint8_t *db;
+	struct fw_rsc_layout l;
+	uint32_t found = 0;
+	unsigned i;
+
+	db = (const uint8_t *)ml_io_map(FW_CMDD_B, FW_CMDD_SZ);
+	if (!db) {
+		printf("FUXI WIFI: cmd-db map failed\n");
+		return;
+	}
+	r = (volatile uint32_t *)ml_io_map(FW_RSC, 0x10000);
+	if (!r) {
+		printf("FUXI WIFI: apps RSC map failed\n");
+		return;
+	}
+	l = fw_layout(r[0]);
+	printf("FUXI WIFI: rsc drv id %#x tcs-cfg %#x stride %u cmd %u\n",
+	    r[0], r[0x0cu / 4u], l.tcs_stride, l.cmd_stride);
+
+	/* Keep the three active TCS done interrupts enabled and clear stale bits. */
+	r[FW_TCS / 4] = 7u;
+	r[(FW_TCS + l.irq_clear) / 4] = 7u;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	for (i = 0; i < sizeof fw_rails / sizeof fw_rails[0]; i++) {
+		uint32_t addr = 0;
+
+		if (fw_db_find(db, FW_CMDD_SZ, fw_rails[i].name, &addr)) {
+			printf("FUXI WIFI: rail %s missing in cmd-db\n", fw_rails[i].name);
+			continue;
+		}
+		found |= 1u << i;
+		printf("FUXI WIFI: rail %s addr %#x -> %u mV\n", fw_rails[i].name,
+		    addr, fw_rails[i].millivolts);
+		fw_rpmh_send(r, &l, addr + 8, 7);                 /* mode: HPM */
+		fw_rpmh_send(r, &l, addr, fw_rails[i].millivolts); /* voltage */
+		fw_rpmh_send(r, &l, addr + 4, 1);                 /* enable */
+		delay(20000);
+	}
+	printf("FUXI WIFI: rails found %#x of %#x\n", found,
+	    (uint32_t)((1u << (sizeof fw_rails / sizeof fw_rails[0])) - 1u));
+}
+
+/* --- WiFi stage 3: WLAN_EN / PERST# / CLKREQ# pins and the two PCIe GDSCs. Both blocks are
+ * clocked by the always-on TLMM and GCC top, so the writes are safe before the PCIe clocks run. */
+static void
+fw_tlmm_pin(volatile uint32_t *t, unsigned pin, uint32_t cfg, int level)
+{
+	if (level >= 0)
+		t[(pin * 0x1000 + 4) / 4] = (uint32_t)(level ? 2u : 0u);
+	t[pin * 0x1000 / 4] = cfg;
+	if (level >= 0)
+		t[(pin * 0x1000 + 4) / 4] = (uint32_t)(level ? 2u : 0u);
+}
+
+static uint32_t
+fw_tlmm_word(volatile uint32_t *t)
+{
+	uint32_t w = 0;
+
+	w |= t[(FW_WLAN_EN * 0x1000 + 4) / 4] & 3u;
+	w |= (t[(FW_PERST * 0x1000 + 4) / 4] & 3u) << 8;
+	w |= (t[(FW_CLKREQ * 0x1000 + 4) / 4] & 3u) << 16;
+
+	return w;
+}
+
+static void
+fw_wifi_power(void)
+{
+	vm_offset_t base;
+	volatile uint32_t *g, *t;
+	unsigned tries;
+	uint32_t power;
+
+	base = ml_io_map(FW_TLMM, FW_TLMM_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: tlmm map failed %#llx\n", (unsigned long long)FW_TLMM);
+		return;
+	}
+	t = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 3 pin word %#x\n", fw_tlmm_word(t));
+
+	/* PERST# is active low: hold the endpoint in reset while the chip is powered up. */
+	printf("FUXI WIFI: perst %u low\n", FW_PERST);
+	fw_tlmm_pin(t, FW_PERST, 1u | 1u << 9, 0);
+	/* CLKREQ# belongs to the PCIe function: function 3, pull up, no output. */
+	fw_tlmm_pin(t, FW_CLKREQ, 3u | 1u << 2, -1);
+	/* Drop WLAN_EN first so the chip starts from nothing, then power it (pwrseq-qcom-wcn: 50 ms). */
+	printf("FUXI WIFI: wlan_en %u low, 150 ms\n", FW_WLAN_EN);
+	fw_tlmm_pin(t, FW_WLAN_EN, 1u | 3u << 6 | 1u << 9, 0);
+	delay(150000);
+	printf("FUXI WIFI: wlan_en %u high, 60 ms\n", FW_WLAN_EN);
+	fw_tlmm_pin(t, FW_WLAN_EN, 1u | 3u << 6 | 1u << 9, 1);
+	delay(60000);
+	printf("FUXI WIFI: pin word after %#x perst cfg %#x/%#x wlan_en cfg %#x/%#x\n",
+	    fw_tlmm_word(t),
+	    t[FW_PERST * 0x1000 / 4], t[(FW_PERST * 0x1000 + 4) / 4],
+	    t[FW_WLAN_EN * 0x1000 / 4], t[(FW_WLAN_EN * 0x1000 + 4) / 4]);
+
+	base = ml_io_map(FW_GCC, FW_GCC_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: gcc map failed\n");
+		return;
+	}
+	g = (volatile uint32_t *)base;
+	/* A set bit in the collapse register keeps a GDSC collapsed: clear PCIe0 (bit 0) and PHY (bit 3). */
+	printf("FUXI WIFI: gdsc collapse before %#x pcie0 %#x phy %#x\n",
+	    g[0x52020 / 4], g[0x6b004 / 4], g[0x6c000 / 4]);
+	g[0x52020 / 4] &= ~(1u << 0 | 1u << 3);
+	for (tries = 0; tries < 100; tries++) {
+		power = (g[0x6b004 / 4] >> 31) | ((g[0x6c000 / 4] >> 31) << 1);
+		if (power == 3)
+			break;
+		delay(10000);
+	}
+	printf("FUXI WIFI: gdsc after %u tries pcie0 %#x phy %#x power %u\n",
+	    tries, g[0x6b004 / 4], g[0x6c000 / 4],
+	    (uint32_t)((g[0x6b004 / 4] >> 31) | ((g[0x6c000 / 4] >> 31) << 1)));
+	printf("FUXI WIFI: stage 3 done\n");
+}
+
+struct fw_phyinit {
+	uint16_t	offset;
+	uint8_t		value;
+};
+
+static const struct fw_phyinit fw_serdes[] = {
+	{0x00c0, 0x01}, {0x00cc, 0x62}, {0x00d0, 0x02}, {0x0060, 0xf8},
+	{0x0064, 0x01}, {0x0000, 0x93}, {0x0004, 0x01}, {0x00e0, 0x90},
+	{0x00e4, 0x82}, {0x00f4, 0x07}, {0x0070, 0x02}, {0x0010, 0x02},
+	{0x0074, 0x16}, {0x0014, 0x16}, {0x0078, 0x36}, {0x0018, 0x36},
+	{0x0110, 0x08}, {0x00bc, 0x0a}, {0x0120, 0x42}, {0x0080, 0x04},
+	{0x0084, 0x0d}, {0x0020, 0x0a}, {0x0024, 0x1a}, {0x0088, 0x41},
+	{0x0028, 0x34}, {0x0090, 0xab}, {0x0094, 0xaa}, {0x0098, 0x01},
+	{0x0030, 0x55}, {0x0034, 0x55}, {0x0038, 0x01}, {0x0140, 0x14},
+	{0x0164, 0x34}, {0x003c, 0x01}, {0x001c, 0x04}, {0x0174, 0x16},
+	{0x01bc, 0x0f}, {0x0170, 0xa0}
+};
+
+static const struct fw_phyinit fw_tx[] = {
+	{0x0e84, 0x15}, {0x0e90, 0x3f}, {0x0ee4, 0x02}, {0x0e40, 0x06},
+	{0x0e3c, 0x18}
+};
+
+static const struct fw_phyinit fw_rx[] = {
+	{0x11a4, 0x38}, {0x10dc, 0x11}, {0x1160, 0xbf}, {0x1164, 0xbf},
+	{0x1168, 0xb7}, {0x116c, 0xea}, {0x115c, 0x3f}, {0x1174, 0x5c},
+	{0x1178, 0x9c}, {0x117c, 0x1a}, {0x1180, 0x89}, {0x1170, 0xdc},
+	{0x1188, 0x94}, {0x118c, 0x5b}, {0x1190, 0x1a}, {0x1194, 0x89},
+	{0x10cc, 0x00}, {0x1008, 0x09}, {0x1014, 0x05}, {0x104c, 0x08},
+	{0x1050, 0x08}, {0x10d8, 0x0f}, {0x1118, 0x1c}, {0x10f8, 0x07},
+	{0x11f8, 0x08}
+};
+
+static const struct fw_phyinit fw_pcs[] = {
+	{0x02dc, 0x05}, {0x0388, 0x77}, {0x0398, 0x0b}, {0x03e0, 0x0f},
+	{0x03d0, 0x8c}
+};
+
+static const struct fw_phyinit fw_pcsmisc[] = {
+	{0x06a4, 0x1e}, {0x06f4, 0x27}, {0x060c, 0x1d}, {0x0614, 0x07},
+	{0x0620, 0xc1}, {0x0694, 0x00}
+};
+
+static void
+fw_wait_clear(volatile uint32_t *reg, uint32_t mask, unsigned tries)
+{
+	unsigned i;
+
+	for (i = 0; i < tries && (*reg & mask); i++)
+		delay(100);
+}
+
+static void
+fw_pulse_reset(volatile uint32_t *g, uint32_t bcr)
+{
+	g[bcr / 4] |= 1u;
+	delay(1000);
+	g[bcr / 4] &= ~1u;
+	delay(1000);
+}
+
+/* WiFi stage 4: the PCIe0 clocks, the controller's PARF set-up, the QMP PHY tables, then PERST#
+ * release and the LTSSM. Ends with a configuration read of the endpoint, which is still in reset
+ * if the link never came up. */
+/* Dump both iATU viewports so we can see the inbound regions the bootloader left. */
+static void
+fw_atu_dump(volatile uint32_t *a)
+{
+	unsigned r;
+	volatile uint32_t *b;
+	for (r = 0; r < 32; r++) {
+		b = a + (r < 16 ? (r * 0x200) / 4 : (0x10000 / 4) + ((r - 16) * 0x200) / 4);
+		printf("FUXI ATU: %s%u ctrl %#x %#x base %#x:%#x limit %#x:%#x tgt %#x:%#x\n",
+		    r < 16 ? "r" : "I", r & 15, b[0], b[1], b[3], b[2], b[8], b[4], b[6], b[5]);
+	}
+}
+
+/* Dump the apps SMMU so we can see whether the WLAN stream IDs bypass translation. */
+#define FW_SMMU		0x15000000u
+static void
+fw_smmu_dump(void)
+{
+	vm_offset_t base;
+	volatile uint32_t *m;
+	unsigned i;
+
+	base = ml_io_map(FW_SMMU, 0x20000);
+	if (base == 0) {
+		printf("FUXI SMMU: map failed\n");
+		return;
+	}
+	m = (volatile uint32_t *)base;
+	printf("FUXI SMMU: idr0 %#x idr1 %#x idr2 %#x scr0 %#x ack %#x gbpa %#x\n",
+	    m[0x00 / 4], m[0x04 / 4], m[0x08 / 4], m[0x00 / 4], m[0x20 / 4], m[0x28 / 4]);
+	for (i = 0; i < 8; i++)
+		printf("FUXI SMMU: smr%u %#x s2cr%u %#x\n", i, m[(0x800 + i * 4) / 4], i,
+		    m[(0xc00 + i * 4) / 4]);
+	printf("FUXI SMMU: scan\n");
+	if (fw_stage >= 11) {
+		vm_offset_t dma2, l1, l2;
+		kern_return_t kr;
+		kr = kmem_alloc_contig(kernel_map, &dma2, 0x800000u, 0x1fffffu, 0x100000u, 0,
+		    KMA_ZERO, VM_KERN_MEMORY_BSD);
+		if (kr != KERN_SUCCESS || dma2 == 0) {
+			kr = kmem_alloc_contig(kernel_map, &dma2, 0x800000u, 0x1fffffu, 0, 0,
+			    KMA_ZERO, VM_KERN_MEMORY_BSD);
+			printf("FUXI SMMU: dma2 retry without the 4 GiB limit %d\n", kr);
+		}
+		printf("FUXI SMMU: dma2 %d %#lx\n", kr, (unsigned long)dma2);
+		if (kr == KERN_SUCCESS && dma2) {
+			uint64_t *t1, *t2, dpa, p1, p2;
+			kr = KERN_SUCCESS;
+			l1 = 0;
+			l2 = 0;
+			if (kmem_alloc(kernel_map, &l1, 0x1000, KMA_ZERO, VM_KERN_MEMORY_BSD) !=
+			    KERN_SUCCESS || kmem_alloc(kernel_map, &l2, 0x1000, KMA_ZERO,
+			    VM_KERN_MEMORY_BSD) != KERN_SUCCESS)
+				kr = KERN_NO_SPACE;
+			if (l1 && l2) {
+				bzero((void *)l1, 0x1000);
+				bzero((void *)l2, 0x1000);
+			}
+			printf("FUXI SMMU: tables %d l1 %#lx l2 %#lx\n", kr,
+			    (unsigned long)l1, (unsigned long)l2);
+			if (kr == KERN_SUCCESS && l1 && l2) {
+				dpa = kvtophys(dma2);
+				p1 = kvtophys(l1);
+				p2 = kvtophys(l2);
+				t1 = (uint64_t *)l1;
+				t2 = (uint64_t *)l2;
+				t1[(FW_IOVA >> 30) & 3u] = p2 | 3u;
+				for (i = 0; i < 4; i++)
+					t2[((FW_IOVA >> 21) & 0x1ffu) + i] = (dpa + (uint64_t)i * 0x200000u) | 0x443u;
+				__asm__ volatile("dsb sy" ::: "memory");
+				printf("FUXI SMMU: l1[%u] %#llx l2[%u] %#llx dpa %#llx\n",
+				    (FW_IOVA >> 30) & 3u, (unsigned long long)t1[(FW_IOVA >> 30) & 3u],
+				    (FW_IOVA >> 21) & 0x1ffu,
+				    (unsigned long long)t2[(FW_IOVA >> 21) & 0x1ffu],
+				    (unsigned long long)dpa);
+				/* Programming CB0 here aborts the bus on the first write, so
+				 * this pass only reads it back: the loader tries the write. */
+				printf("FUXI SMMU: cb0 readback sctlr %#x ttbr0 %#x:%#x tcr %#x\n",
+				    m[0x1000 / 4], m[0x1024 / 4], m[0x1020 / 4], m[0x1030 / 4]);
+				__asm__ volatile("dsb sy" ::: "memory");
+				m[0x820 / 4] = 0x80000000u | 0x1400u;
+				m[0x824 / 4] = 0x80000000u | 0x1401u;
+				m[0xc20 / 4] = 0x2u << 16;
+				m[0xc24 / 4] = 0x2u << 16;
+				__asm__ volatile("dsb sy" ::: "memory");
+				printf("FUXI SMMU: smr8 %#x smr9 %#x s2cr8 %#x s2cr9 %#x sctlr %#x\n",
+				    m[0x820 / 4], m[0x824 / 4], m[0xc20 / 4], m[0xc24 / 4],
+				    m[0x1000 / 4]);
+				printf("FUXI SMMU: cb0 sctlr %#x ttbr0 %#x:%#x tcr %#x fsr %#x fsynr0 %#x gfsr %#x\n",
+				    m[0x1000 / 4], m[0x1024 / 4], m[0x1020 / 4], m[0x1030 / 4],
+				    m[0x1058 / 4], m[0x1068 / 4], m[0x48 / 4]);
+				fw_smmu_win = dma2;
+				fw_bhi_addr = FW_IOVA;
+				if (fw_stage >= 12) {
+					volatile uint32_t *mm =
+					    (volatile uint32_t *)ml_io_map(bar0, FW_MHI_SZ);
+					fw_mhi_contexts(mm, (uint8_t *)dma2, FW_IOVA);
+					fw_bhi_boot(mm);
+				} else {
+					fw_bhi_boot((volatile uint32_t *)ml_io_map(bar0, FW_MHI_SZ));
+				}
+			}
+		}
+	}
+	if (fw_stage >= 10) {
+		unsigned i;
+		printf("FUXI GR0: sweep\n");
+		for (i = 0; i < 16; i++)
+			printf("FUXI GR0: %#x %#x\n", i * 4, m[i]);
+		for (i = 0; i < 8; i++)
+			printf("FUXI SMR: %#x %#x\n", 0x800 + i * 4, m[(0x800 + i * 4) / 4]);
+		for (i = 0; i < 8; i++)
+			printf("FUXI S2CR: %#x %#x\n", 0xc00 + i * 4, m[(0xc00 + i * 4) / 4]);
+		printf("FUXI CB: 0x2000..\n");
+		for (i = 0; i < 8; i++)
+			printf("FUXI CB0: %#x %#x\n", 0x2000 + i * 4, m[(0x2000 + i * 4) / 4]);
+		printf("FUXI CB: 0x2020..\n");
+		for (i = 0; i < 4; i++)
+			printf("FUXI CB0: %#x %#x\n", 0x2020 + i * 4, m[(0x2020 + i * 4) / 4]);
+	}
+	if (fw_stage >= 9) {
+		vm_offset_t low;
+		printf("FUXI SMR8: before read\n");
+		delay(200000);
+		printf("FUXI SMR8: %#x\n", m[0x820 / 4]);
+		printf("FUXI CB0: before read\n");
+		delay(200000);
+		printf("FUXI CB0: sctlr %#x ttbr0 %#x/%#x tcr %#x\n", m[0x1000 / 4],
+		    m[0x1020 / 4], m[0x1024 / 4], m[0x1030 / 4]);
+		printf("FUXI LOW: mapping 0x60300000\n");
+		low = ml_io_map(0x60300000, 0x1000);
+		printf("FUXI LOW: kva %#lx word %#x\n", (unsigned long)low,
+		    low ? *(volatile uint32_t *)low : 0xffffffffu);
+	}
+
+	for (i = 0; i < 128; i++) {
+		uint32_t smr = m[(0x800 + i * 4) / 4];
+		if ((smr & 0x80000000u) == 0)
+			continue;
+		printf("FUXI SMMU: smr[%u] sid %#x mask %#x s2cr %#x\n", i,
+		    smr & 0xffffu, (smr >> 16) & 0x1fu, m[(0xc00 + i * 4) / 4]);
+	}
+	for (i = 0; i < 4; i++)
+		printf("FUXI SMMU: cb%u sctlr %#x ttbr0 %#x %#x tcr %#x fsr %#x\n", i,
+		    m[(0x1000 * (i + 1)) / 4], m[(0x1000 * (i + 1) + 0x20) / 4],
+		    m[(0x1000 * (i + 1) + 0x24) / 4], m[(0x1000 * (i + 1) + 0x30) / 4],
+		    m[(0x1000 * (i + 1) + 0x58) / 4]);
+
+}
+
+static void
+fw_pcie_up(void)
+{
+	vm_offset_t base;
+	volatile uint32_t *g, *t, *f, *d, *p, *a, *c;
+	uint32_t off, tries, power, ms;
+	unsigned i;
+
+	base = ml_io_map(FW_GCC, FW_GCC_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 gcc map failed\n");
+		return;
+	}
+	g = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 4 clocks\n");
+	/* Sources first (an RCG takes its new configuration on CMD bit 0), the pipe mux parked on
+	 * TCXO until the PHY runs, then the branch votes. */
+	g[(FW_AUXRCG + 4) / 4] = 0;
+	g[FW_AUXRCG / 4] |= 1u;
+	g[(FW_RCHNGRCG + 4) / 4] = 6u << 8 | 5u;
+	g[FW_RCHNGRCG / 4] |= 1u;
+	fw_wait_clear(&g[FW_AUXRCG / 4], 1u, 100);
+	fw_wait_clear(&g[FW_RCHNGRCG / 4], 1u, 100);
+	g[FW_PIPEMUX / 4] = (g[FW_PIPEMUX / 4] & ~3u) | 2u;
+	g[FW_VOTE8 / 4] |= FW_VOTE8B;
+	g[FW_VOTE0 / 4] |= FW_VOTE0B;
+	base = ml_io_map(FW_TCSR, 0x1000);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 tcsr map failed\n");
+		return;
+	}
+	((volatile uint32_t *)base)[0x100 / 4] |= 1u;
+	printf("FUXI WIFI: stage 4 clk votes %#x %#x pipe mux %#x\n",
+	    g[FW_VOTE8 / 4], g[FW_VOTE0 / 4], g[FW_PIPEMUX / 4]);
+	delay(200);
+	off = 0;
+	for (i = 0; i < sizeof fw_branches / sizeof fw_branches[0]; i++)
+		if (g[fw_branches[i] / 4] & (1u << 31))
+			off |= 1u << i;
+	printf("FUXI WIFI: stage 4 branches off %#x\n", off);
+	fw_pulse_reset(g, FW_PCIEBRC);
+	fw_pulse_reset(g, FW_PHYBRC);
+
+	base = ml_io_map(FW_PARF, FW_PARF_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 parf map failed\n");
+		return;
+	}
+	f = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 4 parf\n");
+	f[0x1000 / 4] = 4u;
+	f[0x40 / 4] &= ~1u;
+	f[0x350 / 4] = (uint32_t)FW_DBI;
+	f[0x354 / 4] = (uint32_t)(FW_DBI >> 32);
+	f[0x634 / 4] = (uint32_t)FW_ATU;
+	f[0x638 / 4] = (uint32_t)(FW_ATU >> 32);
+	f[0x358 / 4] = 0;
+	f[0x35c / 4] = 0x80000000u;
+	f[0x0 / 4] &= ~(1u << 29);
+	f[0x174 / 4] |= 1u << 4;
+	f[0x20 / 4] &= ~(1u << 5);
+	f[0x1a8 / 4] |= 1u << 31;
+
+	base = ml_io_map(FW_PHY, FW_PHY_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 phy map failed\n");
+		return;
+	}
+	p = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 4 phy tables\n");
+	p[0x240 / 4] |= 3u;
+	for (i = 0; i < sizeof fw_serdes / sizeof fw_serdes[0]; i++)
+		p[fw_serdes[i].offset / 4] = fw_serdes[i].value;
+	for (i = 0; i < sizeof fw_tx / sizeof fw_tx[0]; i++) {
+		p[fw_tx[i].offset / 4] = fw_tx[i].value;
+		p[(fw_tx[i].offset + 0x800) / 4] = fw_tx[i].value;
+	}
+	for (i = 0; i < sizeof fw_rx / sizeof fw_rx[0]; i++) {
+		p[fw_rx[i].offset / 4] = fw_rx[i].value;
+		p[(fw_rx[i].offset + 0x800) / 4] = fw_rx[i].value;
+	}
+	for (i = 0; i < sizeof fw_pcs / sizeof fw_pcs[0]; i++)
+		p[fw_pcs[i].offset / 4] = fw_pcs[i].value;
+	for (i = 0; i < sizeof fw_pcsmisc / sizeof fw_pcsmisc[0]; i++)
+		p[fw_pcsmisc[i].offset / 4] = fw_pcsmisc[i].value;
+	g[FW_PIPEMUX / 4] &= ~3u;
+	p[0x200 / 4] &= ~1u;
+	p[0x244 / 4] |= 3u;
+	delay(1000);
+	for (tries = 0; tries < 100 && (p[0x214 / 4] & (1u << 6)); tries++)
+		delay(100);
+	printf("FUXI WIFI: stage 4 phy status1 %#x tries %u\n", p[0x214 / 4], tries);
+
+	/* The controller tells the SMMU which stream a requester's DMA belongs to from a hash table of
+	 * requester IDs; the iommu-map sends requester 0x100 to stream 0x1401. */
+	for (i = 0; i < 256; i++)
+		f[(0x2000 + 4 * i) / 4] = 0;
+	f[0x2c00 / 4] &= ~1u;
+	{
+		uint8_t crc = 0;
+		uint16_t bdf = 0x100;
+		uint8_t bytes[2];
+		int bit;
+		bytes[0] = (uint8_t)(bdf >> 8);
+		bytes[1] = (uint8_t)bdf;
+		for (i = 0; i < 2; i++) {
+			uint8_t byte = bytes[i];
+			crc ^= byte;
+			for (bit = 0; bit < 8; bit++)
+				crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 7) :
+				    (uint8_t)(crc << 1);
+		}
+		f[(0x2000 + 4 * crc) / 4] = 0x100u << 16 | 1u << 8;
+		printf("FUXI WIFI: stage 4 sid hash %#x entry %#x\n", crc,
+		    f[(0x2000 + 4 * crc) / 4]);
+	}
+
+	base = ml_io_map(FW_DBI, FW_DBI_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 dbi map failed\n");
+		return;
+	}
+	d = (volatile uint32_t *)base;
+	d[0x18 / 4] = 0x00010100;
+	d[0x4 / 4] |= 0x6u;
+
+	base = ml_io_map(FW_TLMM, FW_TLMM_SZ);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 tlmm map failed\n");
+		return;
+	}
+	t = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 4 release perst\n");
+	delay(100000);
+	fw_tlmm_pin(t, FW_PERST, 1u | 1u << 9, 1);
+	delay(1000);
+	f[FW_PARF_LTSSM / 4] |= 1u << 8;
+	printf("FUXI WIFI: stage 4 ltssm enabled, polling\n");
+	ms = 0;
+	while (ms < 1000) {
+		if ((d[0x72c / 4] & (1u << 4)) && (d[0x728 / 4] & 0x3fu) == 0x11)
+			break;
+		delay(1000);
+		ms++;
+	}
+	printf("FUXI WIFI: stage 4 link %u ms debug0 %#x debug1 %#x\n",
+	    ms, d[0x728 / 4], d[0x72c / 4]);
+	printf("FUXI WIFI: stage 4 dbi id %#x linkctl %#x ltssm %#x\n",
+	    d[0], d[0x80 / 4], f[FW_PARF_LTSSM / 4]);
+
+	if (ms >= 1000) {
+		printf("FUXI WIFI: stage 4 no link\n");
+		return;
+	}
+
+	base = ml_io_map(FW_ATU, 0x20000);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 atu map failed\n");
+		return;
+	}
+	a = (volatile uint32_t *)base;
+	a[0x08 / 4] = (uint32_t)FW_CONFIG;
+	a[0x0c / 4] = (uint32_t)(FW_CONFIG >> 32);
+	a[0x10 / 4] = (uint32_t)(FW_CONFIG + 0xfffff);
+	a[0x20 / 4] = (uint32_t)((FW_CONFIG + 0xfffff) >> 32);
+	a[0x14 / 4] = 1u << 24;
+	a[0x18 / 4] = 0;
+	a[0x0 / 4] = 0x4;
+	a[0x04 / 4] = 1u << 31;
+	for (i = 0; i < 5 && !(a[0x04 / 4] & (1u << 31)); i++)
+		delay(10);
+	base = ml_io_map(FW_CONFIG, 0x1000);
+	if (base == 0) {
+		printf("FUXI WIFI: stage 4 config map failed\n");
+		return;
+	}
+	c = (volatile uint32_t *)base;
+	printf("FUXI WIFI: stage 4 endpoint id %#x class %#x\n", c[0], c[0x8 / 4]);
+	/* Cheap decisive probe: does a configuration cycle work while the link is
+	 * healthy?  If this hangs, the config window itself is wrong and no amount
+	 * of endpoint recovery can help. */
+	{
+		volatile uint32_t *cfgp =
+		    (volatile uint32_t *)ml_io_map(FW_CFG_WIN, 0x100000u);
+		printf("FUXI CFG: probe\n");
+		if (cfgp)
+			printf("FUXI CFG: id %#x cmd %#x bar0 %#x bar1 %#x\n",
+			    cfgp[0], cfgp[0x04 / 4], cfgp[0x10 / 4], cfgp[0x14 / 4]);
+		printf("FUXI CFG: probe done\n");
+
+
+	}
+
+	if (fw_stage >= 5) {
+		fw_mhi_probe(a, c, d);
+		if (fw_stage >= 8) {
+			fw_smmu_dump();
+		} else if (fw_stage >= 7) {
+			fw_atu_dump(a);
+		} else if (fw_stage >= 6) {
+			fw_atu_ptr = a;
+			fw_dbi_ptr = d;
+			fw_bhi_boot((volatile uint32_t *)ml_io_map(bar0, FW_MHI_SZ));
+		}
+	} else {
+		printf("FUXI WIFI: stage 4 done\n");
+	}
+}
+
+/* Stage 5: forward the iATU's memory window to bus 1, give the endpoint's BAR0 an address inside it,
+ * turn memory decoding and bus mastering on, and read the MHI registers the BAR starts with. Still
+ * read-only: nothing is written to the MHI block or below it. */
+static void
+fw_mhi_regs(volatile uint32_t *m, uint32_t span)
+{
+	uint32_t bhi, bhie, level5 = 0;
+
+	printf("FUXI MHI: reglen %#x imglow %#x imgsize %#x bhioff %#x bhieoff %#x\n",
+	    m[0x00 / 4], m[0x08 / 4], m[0x10 / 4], m[0x28 / 4], m[0x2c / 4]);
+	printf("FUXI MHI: ctrl %#x status %#x state %#x\n", m[0x38 / 4], m[0x48 / 4],
+	    (m[0x48 / 4] >> 8) & 0xffu);
+	bhi = m[0x28 / 4];
+	bhie = m[0x2c / 4];
+	if (bhi && bhi < span - 0x40) {
+		printf("FUXI MHI: bhi execenv %#x status %#x errcode %#x intvec %#x\n",
+		    m[(bhi + 0x28) / 4], m[(bhi + 0x2c) / 4], m[(bhi + 0x30) / 4],
+		    m[(bhi + 0x20) / 4]);
+		printf("FUXI MHI: bhi imgaddr %#x size %#x txdb %#x\n",
+		    m[(bhi + 0x08) / 4], m[(bhi + 0x10) / 4], m[(bhi + 0x18) / 4]);
+	}
+	if (bhie && bhie < span - 0x48) {
+		printf("FUXI MHI: bhie vecaddr %#x/%#x vecsize %#x vecdb %#x vecstatus %#x\n",
+		    m[(bhie + 0x2c) / 4], m[(bhie + 0x30) / 4], m[(bhie + 0x34) / 4],
+		    m[(bhie + 0x3c) / 4], m[(bhie + 0x44) / 4]);
+	}
+	if (PE_parse_boot_argn("fuximhi", &level5, sizeof level5))
+		printf("FUXI MHI: level %u\n", level5);
+}
+
+#define FW_DMA_PCI	0x61000000u
+#define FW_FW_BASE	0x9fe000000ull	/* 32 MiB GPU scratch, outside the XNU DRAM bank */
+#define FW_FW_WIN	0x800000u
+#define FW_SBL		0x80000u	/* ath12k: sbl_size = SZ_512K */
+
+static uint32_t
+fw_read_file(const char *path, vm_offset_t buf, uint32_t cap)
+{
+	vfs_context_t ctx;
+	vnode_t vp = NULL;
+	struct vnode_attr va;
+	int error, resid = 0;
+	uint32_t size;
+
+	ctx = vfs_context_create(NULL);
+	if (ctx == NULL)
+		return 0;
+	error = vnode_lookup(path, 0, &vp, ctx);
+	if (error) {
+		printf("FUXI MHI: lookup %s failed %d\n", path, error);
+		vfs_context_rele(ctx);
+		return 0;
+	}
+	VATTR_INIT(&va);
+	VATTR_WANTED(&va, va_data_size);
+	error = vnode_getattr(vp, &va, ctx);
+	if (error) {
+		printf("FUXI MHI: getattr %s failed %d\n", path, error);
+		vnode_put(vp);
+		vfs_context_rele(ctx);
+		return 0;
+	}
+	size = (uint32_t)va.va_data_size;
+	printf("FUXI MHI: %s size %u\n", path, size);
+	if (size > cap)
+		size = cap;
+	error = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE,
+	    IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid, NULL);
+	printf("FUXI MHI: read %s -> %d resid %d\n", path, error, resid);
+	vnode_put(vp);
+	vfs_context_rele(ctx);
+	if (error)
+		return 0;
+	return size - (uint32_t)resid;
+}
+
+/* Stage 6: hand the first 512 KiB of amss.bin to the PBL through BHI and wait for the
+ * transfer to complete. The SBL then brings the part up and asks for the rest over BHIe. */
+/* The endpoint's PCIe core restarts while its boot loader comes up: configuration space then
+ * answers again but BAR0 or the memory enable may be zero. Put them back (sheng linkRecover). */
+static uint32_t
+fw_link_recover(volatile uint32_t *cfg, uint32_t bar0, uint32_t cmd)
+{
+	uint32_t nowbar = cfg[0x10 / 4], nowcmd = cfg[0x04 / 4], fixed = 0;
+
+	if (nowbar == 0xffffffffu || nowcmd == 0xffffffffu)
+		return 0;
+	if (nowbar != bar0 && bar0 != 0) {
+		cfg[0x10 / 4] = bar0;
+		fixed |= 1;
+	}
+	if ((nowcmd & 0x6u) != 0x6u) {
+		cfg[0x04 / 4] = (nowcmd & ~0x4u & ~0x2u) | 0x6u;
+		fixed |= 2;
+	}
+	if (fixed)
+		__asm__ volatile("dsb sy" ::: "memory");
+	return fixed ? (0x10000u | fixed) : 0;
+}
+
+/* Stage 12: the device context arrays and rings (sheng WifiProbe.cpp programContexts),
+ * programmed before the SBL is started because the PBL picks them up as the MHI contexts. */
+#define FW_CTX_OFF	0x600000u
+#define FW_CTX_CH	128u
+#define FW_CTX_SZ	44u
+#define FW_EV		2u
+#define FW_CMD_EL	8u
+#define FW_EL		16u
+
+static void
+fw_put64(volatile uint32_t *m, uint32_t off, uint64_t v)
+{
+	m[off / 4] = (uint32_t)v;
+	m[(off + 4) / 4] = (uint32_t)(v >> 32);
+}
+
+static void
+fw_mhi_contexts(volatile uint32_t *m, uint8_t *base, uint64_t iova)
+{
+	uint32_t evlen[FW_EV] = { 32u * FW_EL, 256u * FW_EL };
+	uint32_t evoff = FW_CTX_CH * FW_CTX_SZ;
+	uint32_t cmdoff = evoff + FW_EV * FW_CTX_SZ;
+	uint32_t ring = (cmdoff + FW_CTX_SZ + 4095u) & ~4095u;
+	uint64_t evbase[FW_EV];
+	uint32_t cur = ring, i, at, erdb;
+	uint8_t *p = base + FW_CTX_OFF;
+	uint64_t ctx = iova + FW_CTX_OFF, cmd;
+
+	bzero(p, 0x10000);
+	for (i = 0; i < FW_EV; i++) {
+		evbase[i] = ctx + cur;
+		at = evoff + i * FW_CTX_SZ;
+		*(uint32_t *)(p + at) = i == 0 ? 0 : 1u << 16;
+		*(uint32_t *)(p + at + 4) = 1;              /* MHI_ER_TYPE_VALID */
+		*(uint32_t *)(p + at + 8) = i + 1;          /* MSI vector */
+		*(uint64_t *)(p + at + 12) = evbase[i];
+		*(uint64_t *)(p + at + 20) = evlen[i];
+		*(uint64_t *)(p + at + 28) = evbase[i];
+		*(uint64_t *)(p + at + 36) = evbase[i] + evlen[i] - FW_EL;
+		cur += evlen[i];
+	}
+	cmd = ctx + cur;
+	*(uint64_t *)(p + cmdoff + 12) = cmd;
+	*(uint64_t *)(p + cmdoff + 20) = FW_CMD_EL * FW_EL;
+	*(uint64_t *)(p + cmdoff + 28) = cmd;
+	*(uint64_t *)(p + cmdoff + 36) = cmd;
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	fw_put64(m, 0x58, ctx);                       /* CCABAP */
+	fw_put64(m, 0x60, ctx + evoff);               /* ECABAP */
+	fw_put64(m, 0x68, ctx + cmdoff);              /* CRCBAP */
+	fw_put64(m, 0x80, 0);
+	fw_put64(m, 0x88, 0xffffffffull);
+	fw_put64(m, 0x98, 0);
+	fw_put64(m, 0xa0, 0xffffffffull);
+	m[0x10 / 4] = (m[0x10 / 4] & ~0xff000000u & ~0x00ff0000u) | (FW_EV << 16);
+	erdb = m[0x20 / 4];
+	if (erdb && erdb < FW_MHI_SZ)
+		for (i = 0; i < FW_EV; i++)
+			fw_put64(m, erdb + 8 * i, evbase[i] + evlen[i] - FW_EL);
+	__asm__ volatile("dsb sy" ::: "memory");
+	printf("FUXI MHI: contexts at %#llx ev %#llx/%#llx cmd %#llx erdb %#x\n",
+	    (unsigned long long)ctx, (unsigned long long)evbase[0],
+	    (unsigned long long)evbase[1], (unsigned long long)cmd, erdb);
+}
+
+static void
+fw_bhi_boot(volatile uint32_t *m)
+{
+	volatile uint32_t *bhi;
+	vm_offset_t win = 0;
+	kern_return_t kr;
+	uint64_t pa = 0;
+	unsigned low_dma = 0;
+	uint32_t span, bhioff, size, status = 0, i, sbl, fixed = 0;
+	volatile uint32_t *cfg;
+	char fwname[32];
+	const char *path = "/private/var/ngpu/firmware/ath12k/WCN7850/hw2.0/amss.bin";
+	strlcpy(fwname, "amss.bin", sizeof(fwname));
+	PE_parse_boot_argn("fuxiwifw", fwname, sizeof(fwname));
+	if (fwname[0] != 0) {
+		static char pbuf[96];
+		const char *dir = "/private/var/ngpu/firmware/ath12k/WCN7850/hw2.0/";
+		size_t dl = strlen(dir);
+		if (dl + strlen(fwname) + 1 < sizeof(pbuf)) {
+			memcpy(pbuf, dir, dl);
+			strlcpy(pbuf + dl, fwname, sizeof(pbuf) - dl);
+			path = pbuf;
+		}
+	}
+
+	printf("FUXI MHI: stage 6 starting\n");
+	span = FW_MHI_SZ;   /* mapping size, not MHI_REGLEN (0x100) */
+	if (fw_smmu_win) {
+		win = fw_smmu_win;
+		printf("FUXI MHI: smmu window %#lx iova %#x\n", (unsigned long)win, fw_bhi_addr);
+	} else {
+		printf("FUXI MHI: stage 6 allocating dma buffer\n");
+	/* the endpoint has a 32-bit DMA mask: prefer memory below 4 GiB (0x100000 pages) */
+	kr = kmem_alloc_contig(kernel_map, &win, FW_FW_WIN, 0x3fffu, 0x100000u, 0,
+	    KMA_ZERO, VM_KERN_MEMORY_BSD);
+	low_dma = (kr == KERN_SUCCESS && win != 0);
+	if (!low_dma) {
+		printf("FUXI MHI: no memory below 4 GiB (%d), falling back\n", kr);
+		kr = kmem_alloc_contig(kernel_map, &win, FW_FW_WIN, 0x3fffu, 0, 0,
+		    KMA_ZERO, VM_KERN_MEMORY_BSD);
+	}
+	if (kr != KERN_SUCCESS || win == 0) {
+		printf("FUXI MHI: dma alloc failed %d\n", kr);
+		return;
+	}
+	}
+	printf("FUXI MHI: dma low %u\n", low_dma ? 1u : 0u);
+	printf("FUXI MHI: dma buffer kva %#lx\n", (unsigned long)win);
+	printf("FUXI MHI: stage 6 waiting for vfs\n");
+	delay(2000000);
+	printf("FUXI MHI: vfs wait done\n");
+	delay(10000000);
+	printf("FUXI MHI: stage 6 reading firmware\n");
+	size = fw_read_file(path, win, FW_FW_WIN);
+	if (size == 0) {
+		printf("FUXI MHI: no firmware\n");
+		return;
+	}
+	printf("FUXI MHI: fw at %#lx size %u first words %#x %#x %#x %#x\n",
+	    (unsigned long)win, size,
+	    ((volatile uint32_t *)win)[0], ((volatile uint32_t *)win)[1],
+	    ((volatile uint32_t *)win)[2], ((volatile uint32_t *)win)[3]);
+	bhioff = m[0x28 / 4];
+	if (bhioff == 0 || bhioff >= span - 0xc8) {
+		printf("FUXI MHI: bad bhi offset %#x\n", bhioff);
+		return;
+	}
+	bhi = (volatile uint32_t *)((uintptr_t)m + bhioff);
+	printf("FUXI MHI: bhi version %u.%u\n", bhi[0x00 / 4], bhi[0x04 / 4]);
+	printf("FUXI MHI: writing bhi status\n");
+	bhi[0x2c / 4] = 0;
+	bhi[0x20 / 4] = 0;            /* BHI INT VEC: sheng passes 0 */
+	delay(20000);
+	pa = kvtophys(win);
+	printf("FUXI MHI: dma pa %#llx fw size %u\n", (unsigned long long)pa, size);
+	if (fw_atu_ptr && fw_dbi_ptr && !fw_smmu_win) {
+		volatile uint32_t *r1 = fw_atu_ptr + 0x200 / 4;
+		uint32_t len = (size + 0xfffu) & ~0xfffu;
+		if (len > FW_FW_WIN)
+			len = FW_FW_WIN;
+		r1[0x08 / 4] = (uint32_t)pa;          /* CPU base */
+		r1[0x0c / 4] = (uint32_t)(pa >> 32);
+		r1[0x10 / 4] = (uint32_t)(pa + len - 1);
+		r1[0x20 / 4] = (uint32_t)((pa + len - 1) >> 32);
+		r1[0x14 / 4] = FW_DMA_PCI;            /* PCI target */
+		r1[0x18 / 4] = 0;
+		r1[0x00 / 4] = 0x0;
+		r1[0x04 / 4] = 1u << 31;
+		printf("FUXI MHI: dma window pci %#x target %#llx len %#x ctrl %#x\n",
+		    FW_DMA_PCI, (unsigned long long)pa, len, r1[0x04 / 4]);
+		fw_dbi_ptr[0x20 / 4] = ((FW_DMA_PCI + len - 1) & 0xfff00000u) |
+		    ((0x60000000u >> 16) & 0xfff0u);
+		printf("FUXI MHI: root memory base/limit %#x\n", fw_dbi_ptr[0x20 / 4]);
+	}
+	bhi[0x0c / 4] = 0;
+	bhi[0x08 / 4] = fw_smmu_win ? fw_bhi_addr : FW_DMA_PCI;
+	/* sheng WifiProbe: the PBL takes the first 512 KiB of amss.bin as the SBL */
+	sbl = size < FW_SBL ? size : FW_SBL;
+	bhi[0x10 / 4] = (sbl + 0xfffu) & ~0xfffu;
+	printf("FUXI MHI: writing doorbell\n");
+	delay(20000);
+	bhi[0x18 / 4] = 0x5eedu;
+	printf("FUXI MHI: bhi armed file %s addr %#x size %#x\n", path, bhi[0x08 / 4], bhi[0x10 / 4]);
+	for (i = 0; i < 600; i++) {
+		status = bhi[0x2c / 4];
+		if (i < 20 || (i % 100) == 0)
+			printf("FUXI MHI: poll %u status %#x errcode %#x\n",
+			    i, status, bhi[0x30 / 4]);
+		/* 0xffffffff is the PBL still working, not an error (sheng MhiBoot.c:94) */
+		if (status == 0xffffffffu || ((status >> 30) & 0x3u) == 0u) {
+			delay(10000);
+			continue;
+		}
+		if (((status >> 30) & 0x3u) == 2u || ((status >> 30) & 0x3u) == 3u)
+			break;
+		delay(10000);
+	}
+	printf("FUXI MHI: bhi status %#x after %u ms errcode %#x dbg %#x/%#x/%#x\n",
+	    status, i, bhi[0x30 / 4], bhi[0x34 / 4], bhi[0x38 / 4], bhi[0x3c / 4]);
+	if (fw_atu_ptr && fw_dbi_ptr) {
+		volatile uint32_t *pf = fw_atu_ptr;
+		printf("FUXI MHI: link parf ltssm %#x dbi id %#x linkctl %#x reglen %#x\n",
+		    pf[0x1b0 / 4], fw_dbi_ptr[0], fw_dbi_ptr[0x80 / 4], m[0x00 / 4]);
+	}
+	printf("FUXI MHI: execenv %#x numseg %#x state %#x\n", bhi[0x28 / 4],
+	    bhi[0x48 / 4], (m[0x48 / 4] >> 8) & 0xffu);
+	if (status == 0xffffffffu || ((status >> 30) & 0x3u) == 3u) {
+		volatile uint32_t *sm = (volatile uint32_t *)ml_io_map(0x15000000u, 0x20000u);
+		delay(200000);
+		printf("FUXI MHI: retry status %#x errcode %#x state %#x\n",
+		    bhi[0x2c / 4], bhi[0x30 / 4], (m[0x48 / 4] >> 8) & 0xffu);
+		printf("FUXI SMMU: fault gfsr %#x gfsynr0 %#x gfsynr1 %#x cb0fsr %#x cb0fsynr0 %#x\n",
+		    sm[0x48 / 4], sm[0x4c / 4], sm[0x50 / 4], sm[0x1058 / 4], sm[0x1068 / 4]);
+	}
+	printf("FUXI MHI: stage 6 done\n");
+}
+
+static void
+fw_mhi_probe(volatile uint32_t *patu, volatile uint32_t *pcfg, volatile uint32_t *pdbi)
+{
+	volatile uint32_t *r1, *m;
+	vm_offset_t base;
+	uint32_t mask, size, address, command;
+
+	printf("FUXI MHI: stage 5 starting\n");
+	/* region 1: CPU window to the same PCI addresses the devices see */
+	r1 = patu + 0x200 / 4;
+	r1[0x08 / 4] = FW_MEMBASE;
+	r1[0x0c / 4] = 0;
+	r1[0x10 / 4] = FW_MEMBASE + FW_MEMSIZE - 1;
+	r1[0x20 / 4] = 0;
+	r1[0x14 / 4] = FW_MEMBASE;
+	r1[0x18 / 4] = 0;
+	r1[0x00 / 4] = 0x0;
+	r1[0x04 / 4] = 1u << 31;
+	for (size = 0; size < 5 && !(r1[0x04 / 4] & (1u << 31)); size++)
+		delay(10);
+	/* type 1 header memory base/limit so the root port forwards bus 1's memory */
+	pdbi[0x20 / 4] = ((FW_MEMBASE + FW_MEMSIZE - 1) & 0xfff00000u) |
+	    ((FW_MEMBASE >> 16) & 0xfff0u);
+	/* BAR0: size it while it decodes nothing, then put it at the start of the window */
+	mask = pcfg[0x10 / 4];
+	pcfg[0x10 / 4] = 0xffffffffu;
+	mask = pcfg[0x10 / 4];
+	pcfg[0x10 / 4] = 0;
+	if ((mask & ~0xfu) == 0) {
+		printf("FUXI MHI: bar0 not implemented (%#x)\n", mask);
+		return;
+	}
+	size = ~(mask & ~0xfu) + 1;
+	if (size > FW_MHI_SZ)
+		size = FW_MHI_SZ;
+	address = (FW_MEMBASE + size - 1) & ~(size - 1);
+	pcfg[0x10 / 4] = address | (mask & 0xfu);
+	if ((mask & 6u) == 4u)
+		pcfg[0x14 / 4] = 0;
+	command = (pcfg[0x04 / 4] & 0xffff0000u) | 0x6u;
+	pcfg[0x04 / 4] = command;
+	printf("FUXI MHI: bar0 mask %#x size %#x address %#x command %#x\n", mask, size,
+	    address, command);
+	bar0 = address;
+	fw_bar0_saved = address;
+	fw_cmd_saved = command;
+	base = ml_io_map(address, size);
+	if (base == 0) {
+		printf("FUXI MHI: bar map failed\n");
+		return;
+	}
+	m = (volatile uint32_t *)base;
+	fw_mhi_regs(m, size);
+	printf("FUXI MHI: stage 5 done\n");
+}
+
+static void
+fk_wifi_thread(void *arg, wait_result_t wr)
+{
+	unsigned stage = (unsigned)(uintptr_t)arg;
+
+	(void)wr;
+	thread_set_thread_name(current_thread(), "fuxi-wifi");
+	printf("FUXI WIFI: stage %u starting\n", stage);
+
+	fw_read_gcc("before");
+	if (stage >= 2) {
+		printf("FUXI WIFI: voting WCN7850 rails\n");
+		fw_power_rails();
+		fw_read_gcc("after");
+	}
+	if (stage >= 3) {
+		printf("FUXI WIFI: powering pins and GDSCs\n");
+		fw_wifi_power();
+	}
+	if (stage >= 4) {
+		fw_stage = stage;
+		printf("FUXI WIFI: stage 4 starting\n");
+		fw_pcie_up();
+	}
+	printf("FUXI WIFI: probe done\n");
+}
+
+void
+fuxi_wifi_probe_init(void)
+{
+	unsigned stage = 0;
+	thread_t thread = THREAD_NULL;
+
+	if (!PE_parse_boot_argn("fuxiwifiprobe", &stage, sizeof stage) || stage == 0) {
+		return;
+	}
+	if (kernel_thread_start(fk_wifi_thread, (void *)(uintptr_t)stage, &thread) ==
+	    KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		printf("FUXI WIFI: thread start failed\n");
+	}
 }
 #endif /* FUXI */
