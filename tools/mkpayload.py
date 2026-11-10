@@ -67,7 +67,7 @@ SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
 # payload version -> boot_args.CommandLine size of the kernel it carries
 BOOT_LINES = {1: 608, 2: 1024}
 # payload version -> largest ADT the loader copies (shim/fuxi-loader/loader.c ADT_MAX_V2)
-ADT_MAX = {1: 0x4000, 2: 0x10000}
+ADT_MAX = {1: 0x10000, 2: 0x10000}
 
 
 def parse_macho(buf):

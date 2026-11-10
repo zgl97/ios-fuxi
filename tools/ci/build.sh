@@ -148,10 +148,13 @@ fetch_verified() {
 }
 
 install_gum() {
-    fetch_verified "https://github.com/charmbracelet/gum/releases/download/v$GUM_VERSION/gum_${GUM_VERSION}_Darwin_arm64.tar.gz" \
-        "gum-$GUM_VERSION-darwin-arm64.tar.gz" "$GUM_SHA256"
+    # Hosted macOS runners are arm64 or x64; the pinned binary must match the host.
+    local arch=arm64 sha=$GUM_SHA256
+    if [[ $(uname -m) != arm64 ]]; then arch=x86_64 sha=$GUM_SHA256_X86_64; fi
+    fetch_verified "https://github.com/charmbracelet/gum/releases/download/v$GUM_VERSION/gum_${GUM_VERSION}_Darwin_${arch}.tar.gz" \
+        "gum-$GUM_VERSION-darwin-$arch.tar.gz" "$sha"
     mkdir -p "$work/gum"
-    tar -xzf "$downloads/gum-$GUM_VERSION-darwin-arm64.tar.gz" -C "$work/gum"
+    tar -xzf "$downloads/gum-$GUM_VERSION-darwin-$arch.tar.gz" -C "$work/gum"
     # The pinned builder rebuilds PATH from Xcode, system dirs and the Homebrew
     # prefix only, so builder-visible tools go into that prefix.
     install -m 0755 "$(find "$work/gum" -type f -name gum | head -1)" "$(brew --prefix)/bin/gum"
