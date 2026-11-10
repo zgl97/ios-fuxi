@@ -114,7 +114,7 @@ static const char *loader_boot(void)
   return "bad embedded payload header";
  const uint64_t line = p->version == 1 ? BOOT_LINE_V1 : BOOT_LINE_V2;
  /* v2 (iOS 27) ADTs may carry the K4 root extent table (tools/mkadt-fuxi27.py). */
- const uint64_t adt_max = p->version == 1 ? PAGE_16K : ADT_MAX_V2;
+ const uint64_t adt_max = ADT_MAX_V2;  /* fuxi: allow up to 64 KiB ADTs, 626-extent roots need ~27 KiB */
  const struct payload_seg *segs = (const struct payload_seg *)(rd_start + sizeof(*p) + line);
  if (p->nsegs == 0 || p->nsegs > 32 ||
      length < sizeof(*p) + line + p->nsegs * sizeof(struct payload_seg))

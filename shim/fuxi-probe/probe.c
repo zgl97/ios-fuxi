@@ -1180,6 +1180,9 @@ ud_setup(void)
             usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
             ok=false;
         else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);
+    } else if (type == 0xc0 && req == 0x59) {
+        uint32_t sb=usb_rd(0xae05000,0x14);
+        memcpy(data,&sb,4); n=4;
     } else if (type == 0xc0 && req == 0x4f) {
         /* Read-only display pipeline windows from live FDT: MDP top, CTL0,
          * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. MDSS top
@@ -1469,7 +1472,7 @@ void probe_main(uintptr_t fdt)
  extern char _head[], _end[];
  monitor_report[MON_MAGIC]=0x31304e4f4d495846ULL; /* FXIMON01 */
  monitor_report[MON_IMAGE]=(uintptr_t)_head; monitor_report[MON_END]=(uintptr_t)_end;
- monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*90;
+ monitor_report[MON_DEADLINE]=rsr("cntpct_el0")+rsr("cntfrq_el0")*3600;
  probe_info.magic=0x45424f5250495846ULL; /* little-endian FXIPROBE */
  probe_info.version=1;
  probe_info.midr=rsr("midr_el1"); probe_info.mpidr=rsr("mpidr_el1");
