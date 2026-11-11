@@ -52,7 +52,7 @@ def main():
     if args.check:
         assert PATCH.read_text() == expected, 'P-UNIXNU sources differ; run tools/sync-fuxi-unixnu.py'
     else:
-        PATCH.write_text(expected)
+        PATCH.write_text(expected, newline='')
     with tempfile.TemporaryDirectory(prefix='fuxi-unixnu-check-') as tmp:
         for name, value in before.items():
             if value:

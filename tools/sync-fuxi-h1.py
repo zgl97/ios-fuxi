@@ -52,7 +52,7 @@ def main():
     if args.check:
         assert PATCH.read_text() == expected, 'H1 sources differ; run tools/sync-fuxi-h1.py'
     else:
-        PATCH.write_text(expected)
+        PATCH.write_text(expected, newline='')
     # Verify the generated overlay really applies after the input stack.
     with tempfile.TemporaryDirectory(prefix='fuxi-h1-check-') as tmp:
         for name, text in before.items():
