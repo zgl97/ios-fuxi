@@ -29,7 +29,7 @@ def macho(path,kind):
     if pos!=32+total or not signed or not minimum:raise ValueError('requires signed iOS 16.0 artifact')
 
 
-def validate_clients(path,enable_backboardd=False):
+def validate_clients(path,enable_backboardd=False,enable_springboard=False):
     raw=path.read_bytes()
     if len(raw)>8192 or b'\0' in raw:raise ValueError('invalid client config')
     seen={}
@@ -40,13 +40,15 @@ def validate_clients(path,enable_backboardd=False):
         if line.startswith(b'census '):mode='census';line=line[7:].lstrip(b' \t')
         if not re.fullmatch(rb'[A-Za-z0-9_.-]{1,63}',line):raise ValueError('invalid client name')
         # ClientGate.hpp hiddenClient(): both abort on any visible device (docs-lanes/cooling.md).
-        if line in (b'SpringBoard',b'mediaserverd'):raise ValueError(line.decode()+' is permanently denied')
+        if line==b'mediaserverd':raise ValueError('mediaserverd is permanently denied')
+        if line==b'SpringBoard' and not enable_springboard:raise ValueError('SpringBoard requires --enable-springboard')
         if line==b'backboardd' and (not enable_backboardd or mode!='allow'):
             raise ValueError('backboardd requires --enable-backboardd and an allow entry')
         if line in seen and seen[line]!=mode:raise ValueError('conflicting client modes')
         seen[line]=mode
     # The flag generates the protected config key; shipped input stays smoke-only.
     if enable_backboardd and b'backboardd' not in seen:raw=raw.rstrip(b'\n')+b'\nbackboardd\n'
+    if enable_springboard and b'SpringBoard' not in seen:raw=raw.rstrip(b'\n')+b'\nSpringBoard\n'
     if len(raw)>8192:raise ValueError('enabled client config exceeds 8192 bytes')
     return raw
 
@@ -91,7 +93,7 @@ def prepare_backboard_storage(root,account):
     print('staged /private/var/db/fuxi-metal/backboardd-%u uid=%u gid=%u 0700'%(uid,uid,gid))
 
 
-def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False,native_bundle=None,native_bridge=None,native_source=None,prepare_pipeline_cache=False):
+def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-clients.conf'),translator=None,metallib=None,source=None,ca_smoke=None,ca_conf=Path(__file__).with_name('ca-smoke.conf'),enable_backboardd=False,native_bundle=None,native_bridge=None,native_source=None,prepare_pipeline_cache=False,enable_springboard=False):
     if os.geteuid()!=0:raise PermissionError('run as root to set root:wheel 0:0')
     root=root.resolve()
     if not (root/'System/Library').is_dir():raise ValueError('expected mounted iOS root')
@@ -103,7 +105,7 @@ def stage(root,icd,bundle,smoke,conf,clients=Path(__file__).with_name('metal-cli
     if translator is None:translator=smoke.parent/'libmetal2vulkan.dylib'
     if metallib is None:metallib=smoke.parent/'metal-smoke.metallib'
     if source is None:source=smoke.parent/'metal2vulkan-source.tar.gz'
-    client_data=validate_clients(clients,enable_backboardd)
+    client_data=validate_clients(clients,enable_backboardd,enable_springboard)
     account=backboard_account(root) if enable_backboardd or prepare_pipeline_cache else None
     info=plistlib.loads((bundle/'Info.plist').read_bytes())
     if any(info.get(k)!=v for k,v in {'CFBundleExecutable':'FuxiMetal','NSPrincipalClass':'FuxiMTLDevice','CFBundleIdentifier':'org.fuxi.metal'}.items()):
@@ -174,5 +176,6 @@ if __name__=='__main__':
     ap.add_argument('--native-bridge',type=Path,help='separately replaceable native Rust dylib')
     ap.add_argument('--native-source',type=Path,help='NativeMetal corresponding-source archive')
     ap.add_argument('--enable-backboardd',action='store_true',help='add backboardd allow entry and private storage; also requires boot arg fuxibbgpu=1 (2 is a diagnostic survey; may blank screen for ~20s)')
+    ap.add_argument('--enable-springboard',action='store_true',help='add SpringBoard allow entry; also requires boot arg fuxispringboard=1')
     ap.add_argument('--prepare-pipeline-cache',action='store_true',help='pre-create persistent backboardd cache storage using the target launchd UID; does not admit clients or enable fuxigpucache=1')
-    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd,a.native_bundle,a.native_bridge,a.native_source,a.prepare_pipeline_cache)
+    a=ap.parse_args();stage(a.root,a.icd,a.bundle,a.smoke,a.conf,a.clients,a.translator,a.metallib,a.source,a.ca_smoke,a.ca_conf,a.enable_backboardd,a.native_bundle,a.native_bridge,a.native_source,a.prepare_pipeline_cache,a.enable_springboard)
