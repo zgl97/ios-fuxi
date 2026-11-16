@@ -169,6 +169,7 @@ def main():
     ap.add_argument('--seconds', type=float, default=65)
     ap.add_argument('--framebuffer',action='store_true',help='save the validated inherited framebuffer after collecting logs')
     ap.add_argument('--tour-shots',action='store_true',help='also save framebuffer-shotN-NAME.png at each "FUXI TOUR: shot N NAME" console line (fuxitour=S)')
+    ap.add_argument('--strip-watch',metavar='Y0,H',help='after handoff: sample framebuffer rows [Y0,Y0+H) as fast as USB allows and log per-sample change counts to strip.jsonl')
     ap.add_argument('--skip-clocks',action='store_true',help='do not take the AHB-ungating clock snapshot before handoff')
     ap.add_argument('--reset-minutes',type=int,help='move the monitor PSCI reset deadline to now + N minutes (1-60)')
     ap.add_argument('--touch-test',type=float,metavar='SECONDS',help='before handoff: touch snapshot, power-up, then poll touch events for SECONDS')
@@ -405,6 +406,21 @@ def main():
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/(name+'.png')).write_bytes(png)
     tour_tail, tour_done, ring = b'', set(), None
+    strip_log = prev_block = prev_digest = None
+    strip_rows = None
+    if args.strip_watch:
+        y0, rows = (int(x) for x in args.strip_watch.split(','))
+        if not (0 <= y0 and rows > 0 and (y0 + rows) * 4320 <= 1080 * 2400 * 4):
+            ap.error('--strip-watch rows outside the 1080x2400 framebuffer')
+        strip_rows = (y0 * 4320, rows * 4320)
+        strip_log = (args.out / 'strip.jsonl').open('w')
+
+    def read_strip():
+        start, length = strip_rows
+        out = bytearray()
+        for off in range(start, start + length, 512):
+            out.extend(request(0x4e, min(512, start + length - off), off & 0xffff, off >> 16))
+        return bytes(out)
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         reconnects = 0
         while time.monotonic() < until:
@@ -452,6 +468,20 @@ def main():
                         shot_start = time.monotonic()
                         save_framebuffer('framebuffer-shot%s-%s' % (m.group(1).decode(), m.group(2).decode()))
                         print('tour shot', m.group(1).decode(), m.group(2).decode(), 'saved in %.1f s' % (time.monotonic()-shot_start), flush=True)
+            if strip_rows:
+                try:
+                    block = read_strip()
+                except usb.core.USBError as e:
+                    strip_log.write(json.dumps({'t': round(time.monotonic()-handoff,3), 'error': str(e)})+chr(10))
+                    strip_log.flush()
+                else:
+                    digest = zlib.crc32(block)
+                    changed = 0
+                    if prev_block is not None and digest != prev_digest:
+                        changed = sum(1 for a, b in zip(block, prev_block) if a != b)
+                    strip_log.write(json.dumps({'t': round(time.monotonic()-handoff,3), 'console_total': status.get('console_total'), 'changed': changed})+chr(10))
+                    strip_log.flush()
+                    prev_block, prev_digest = block, digest
             if args.display_poll:
                 status['display'] = display_poll()
             progress.write(json.dumps(status)+'\n')
@@ -482,7 +512,9 @@ def main():
             if args.reset_minutes and time.monotonic() > renew:
                 request(0x54, 8, args.reset_minutes)
                 renew = time.monotonic() + 600
-            time.sleep(.25)
+            time.sleep(.02 if strip_rows else .25)
+    if strip_log:
+        strip_log.close()
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
         save_framebuffer('framebuffer')
