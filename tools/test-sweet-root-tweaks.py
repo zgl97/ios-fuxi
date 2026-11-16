@@ -227,6 +227,20 @@ with tempfile.TemporaryDirectory() as root:
     assert plistlib.load(open(ax, 'rb')) == {'Other': 1}             # other keys kept
 
 with tempfile.TemporaryDirectory() as root:
+    owner = (os.getuid(), os.getgid())
+    ax = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.Accessibility.plist')
+    m.reduce_motion(root, False, owner)                           # absent: no file created
+    assert not os.path.exists(ax)
+    m.reduce_motion(root, True, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'ReduceMotionEnabled': True}
+    assert os.stat(ax).st_mode & 0o777 == 0o600
+    m.reduce_transparency(root, True, owner)                      # both switches coexist
+    assert plistlib.load(open(ax, 'rb')) == {'ReduceMotionEnabled': True,
+                                             'EnhancedBackgroundContrastEnabled': True}
+    m.reduce_motion(root, False, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'EnhancedBackgroundContrastEnabled': True}
+
+with tempfile.TemporaryDirectory() as root:
     assert m.mg_cache_extra(root, [m.MG_DEEP_COLOR + '=false']) is False      # absent: not created
     path = os.path.join(root, m.MG_CACHE)
     assert not os.path.exists(path)
@@ -245,4 +259,4 @@ with tempfile.TemporaryDirectory() as root:
             pass
 
 print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs, '
-      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency, MobileGestalt CacheExtra')
+      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency/motion, MobileGestalt CacheExtra')

@@ -116,22 +116,34 @@ def merge_pref(root, name, values):
 
 AX_PREF = 'com.apple.Accessibility'
 AX_REDUCE_TRANSPARENCY = 'EnhancedBackgroundContrastEnabled'
+AX_REDUCE_MOTION = 'ReduceMotionEnabled'
+
+
+def _ax_switch(root, key, enable, owner, label):
+    path = os.path.join(root, 'private/var/mobile/Library/Preferences', AX_PREF + '.plist')
+    data = load(path) if os.path.exists(path) else {}
+    if enable:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data[key] = True
+    elif data.pop(key, None) is None:
+        print('pref', AX_PREF, label, 'already off')
+        return
+    save(path, data, owner[0], owner[1], 0o600)
+    print('pref', AX_PREF, label, 'on' if enable else 'off')
 
 
 def reduce_transparency(root, enable, owner=(MOBILE, MOBILE)):
     """Settings > Accessibility > Reduce Transparency: solid fills in place of
     the blur materials behind widgets, the dock and folders (fewer GPU passes
     and CPU-encoded draws per compositor frame)."""
-    path = os.path.join(root, 'private/var/mobile/Library/Preferences', AX_PREF + '.plist')
-    data = load(path) if os.path.exists(path) else {}
-    if enable:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        data[AX_REDUCE_TRANSPARENCY] = True
-    elif data.pop(AX_REDUCE_TRANSPARENCY, None) is None:
-        print('pref', AX_PREF, 'reduce transparency already off')
-        return
-    save(path, data, owner[0], owner[1], 0o600)
-    print('pref', AX_PREF, 'reduce transparency', 'on' if enable else 'off')
+    _ax_switch(root, AX_REDUCE_TRANSPARENCY, enable, owner, 'reduce transparency')
+
+
+def reduce_motion(root, enable, owner=(MOBILE, MOBILE)):
+    """Settings > Accessibility > Motion > Reduce Motion: the app-open zoom and
+    the lock-screen unlock become cross-fades, so SpringBoard composites fewer
+    full-panel frames between the icon tap and the first frame of the app."""
+    _ax_switch(root, AX_REDUCE_MOTION, enable, owner, 'reduce motion')
 
 
 MG_CACHE = 'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist'
@@ -713,6 +725,9 @@ def main():
     transparency = ap.add_mutually_exclusive_group()
     transparency.add_argument('--reduce-transparency', action='store_true')
     transparency.add_argument('--no-reduce-transparency', action='store_true')
+    motion = ap.add_mutually_exclusive_group()
+    motion.add_argument('--reduce-motion', action='store_true')
+    motion.add_argument('--no-reduce-motion', action='store_true')
     ap.add_argument('--only-optional', action='store_true')
     args = ap.parse_args()
     root = args.root
@@ -734,6 +749,8 @@ def main():
         rebuild_launchservices(root)
     if args.reduce_transparency or args.no_reduce_transparency:
         reduce_transparency(root, args.reduce_transparency)
+    if args.reduce_motion or args.no_reduce_motion:
+        reduce_motion(root, args.reduce_motion)
     if args.legacy_wallpaper or args.no_legacy_wallpaper:
         legacy_wallpaper(root, args.legacy_wallpaper)
     if args.legacy_wallpaper_image:
