@@ -166,6 +166,7 @@ typedef struct {void (*fn)(void *,void *);} thread_call_data_t;
 static uint64_t ticks;
 static uint64_t counter(const char *name) {return strcmp(name,"cntfrq_el0")?ticks:1000000;}
 static uint64_t mach_absolute_time(void) {return ticks;}
+static unsigned ml_get_cpu_number_local(void) {return 0;}
 #define rsr(r) counter(r)
 static unsigned fg_abi_present_wait;
 #define G4_FB_PA 0xb8000000ULL
@@ -476,6 +477,12 @@ int main(void) {
   assert(!fg_abi_imports[i].iova);
  }
  puts("PASS: all 512 import slots, overflow refusal, high-slot reuse, full cache retirement and unmap");
+ // A read-only CPU import still carries the caller's GPU permissions: perms=3
+ // leaves must be GPU-writable, while perms=1 leaves stay GPU-read-only.
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,3));
+ assert((*fg_abi_leaf(va)&0xc0)==0x40);assert(!fuxi_gpu_abi_unmap(va,16384));
+ reset();assert(!fuxi_gpu_abi_map_import(va,source,16384,1));
+ assert((*fg_abi_leaf(va)&0xc0)==0xc0);assert(!fuxi_gpu_abi_unmap(va,16384));
  // Indirectly referenced imported BOs must participate, even though the IB
  // itself lives in a different ordinary BO. Watchdog retires without WaitFence.
  reset();

@@ -94,7 +94,7 @@ inline void importCheck(VkResult r,int line=__builtin_LINE()) {
  X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) X(CreateDescriptorPool) X(DestroyDescriptorPool) \
  X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CmdBindDescriptorSets) X(CreateImageView) X(DestroyImageView) X(CreateRenderPass) X(DestroyRenderPass) \
  X(CreateFramebuffer) X(DestroyFramebuffer) X(CreateShaderModule) X(DestroyShaderModule) \
- X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(DestroyPipeline) \
+ X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(DestroyPipeline) X(CmdDispatch) X(CmdDispatchIndirect) \
  X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) \
  X(CmdBindVertexBuffers) X(CmdBindIndexBuffer) X(CmdDrawIndexed) X(CmdSetViewport) X(CmdSetScissor) X(CmdPushConstants) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) X(CmdDraw) X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(QueueSubmit) X(WaitForFences)
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void *contents{};void *key{};Buffer *spare{};void *shadowKey() const{return key?key:contents;}bool shadowBacking=false,directUse=false,spareFailed=false,aliased=false; size_t length{}, allocated{},charged{},memoryBytes{},memoryOffset{},references=1;uint32_t memoryType{};bool imported=false,upload=false,poolable=false,gpuWritten=false,daWritten=false;uint64_t planStamp=0; }; // planStamp: FUXI_MTL_SUBMIT_LEAN per-submit dedupe mark
@@ -115,6 +115,7 @@ struct VariantKey {
  bool operator==(const VariantKey &other) const {return words==other.words;}
 };
 struct Pipeline {uint32_t id{},fragInstr{},fragSamples{},fragLoops{},fragKills{},fragHash{},unrolled{};ShadowWindow shadowWindows[2][resourceSlots]{};std::array<uint32_t,resourceSlots> textureTypes{};size_t references=1,retainedBytes=0;bool writesStorage=false;void *translation{};CompileOptions options{};uint32_t fetchMask{};bool orderedColorAccess=false;std::vector<std::pair<uint32_t,VkRenderPass>> renders;VkPipeline pipeline{},stripPipeline{};std::array<VkPipeline,2> linePipelines{};std::array<VkPipeline,4> nfPipelines{};Translation recipe{};VkPipelineLayout layout{};VkRenderPass render{};uint32_t pushOffset{},pushSize{},pushStages{};uint8_t pushBytes[128]{};VkDescriptorSetLayout setLayout{};VkSampler bakedSamplers[16]{};BakedSampler bakedSamplerInfo[16]{};MipAccess mipAccess[2];uint32_t readOnlyStorage[2]{};std::vector<Descriptor> descriptors;std::vector<Buffer *> constantBlobs;std::vector<std::string> blobKeys;std::vector<std::array<uint8_t,32>> blobHashes;std::vector<std::pair<VariantKey,Pipeline *>> variants;
+ ComputeTranslation computeRecipe{};void *computeTranslation{};std::vector<std::pair<uint64_t,VkPipeline>> computePipelines;
 };
 struct BufferBind {Buffer *buffer{};uint64_t offset{};bool bytes=false;uint32_t end{};
  uint64_t length() const{return end?end:buffer?buffer->length:0;}};
@@ -134,6 +135,8 @@ struct Operation {
  // Command-local Metal encoder identity. Zero is unknown and never merges.
  // The frontend rejects nonzero slices/depth planes and multisampling.
  uint64_t encoderID{};
+ // Compute dispatch: threadgroup count and threads per group. No render target.
+ bool compute=false,computeIndirect=false;Buffer *indirect{};uint64_t indirectOffset{};uint32_t computeGroups[3]{},computeThreads[3]{};
  ColorTarget color(unsigned i) const {if(!(colorMask&(1u<<i)))return {};if(i)return colors[i-1];ColorTarget c{texture,dstLevel,load,store,{}};memcpy(c.clear,clear,sizeof(clear));return c;}
  void setColor(unsigned i,const ColorTarget &c){if(i){colors[i-1]=c;return;}texture=c.texture;dstLevel=c.level;load=c.load;store=c.store;memcpy(clear,c.clear,sizeof(clear));}
 
@@ -380,6 +383,20 @@ public:
  void discardReuseForTest(){std::lock_guard<std::mutex> guard(mutex);requireLive();for(auto &slot:slots)clearSubmitObjects(slot);clearFrames();clearViews();}
 #endif
  void trimMemory(){std::lock_guard<std::mutex> guard(mutex);trimMemoryUnlocked(true);}
+ uint64_t pipelineCacheBytes() {
+  std::lock_guard<std::mutex> guard(mutex);
+  if(!device || !pipelineCache.get())return 0;
+  size_t bytes=0;
+  if(GetPipelineCacheData(device,pipelineCache.get(),&bytes,nullptr)!=VK_SUCCESS)return 0;
+  return bytes;
+ }
+ bool checkpointPipelineCache() {
+  std::lock_guard<std::mutex> guard(mutex);
+  if(!device || !pipelineCache.get())return false;
+  pipelineCache.finishedPair(1000.0);
+  pipelineCache.checkpoint();
+  return pipelineCacheSaveResult.load()==1;
+ }
  uint32_t maxTextureDimension() const{return limits.dimension;}
  uint64_t optionalShedCount() const{return optionalSheds;}
  size_t resourceBytes() const{std::lock_guard<std::mutex> guard(mutex);return limits.used;}
@@ -719,11 +736,12 @@ public:
  void destroy(Sampler *s) {std::lock_guard<std::mutex> guard(mutex);destroySamplerUnlocked(s);}
  // address: Metal MTLSamplerAddressMode per axis (0 clamp-to-edge, 2 repeat, 3 mirror repeat, 4 clamp-to-zero,
  // 5 clamp-to-border with border 0/1/2 = transparent black/opaque black/opaque white). Mirror clamp-to-edge (1) is refused.
- Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX,const uint32_t *address=nullptr,uint32_t border=0,uint32_t anisotropy=1) {
+ Sampler *allocateSampler(bool minLinear,bool magLinear,uint32_t mip=0,float minLod=0,float maxLod=FLT_MAX,const uint32_t *address=nullptr,uint32_t border=0,uint32_t anisotropy=1,bool normalized=true) {
   std::lock_guard<std::mutex> guard(mutex);requireLive();auto *s=new Sampler{};s->lodMin=minLod;s->lodMax=maxLod;s->filters=1|(minLinear?2:0)|(magLinear?4:0)|(mip<<3);
   if(mip>2 || !std::isfinite(minLod) || !std::isfinite(maxLod) || minLod<0 || maxLod<minLod){delete s;throw std::runtime_error("sampler mip/LOD");}
   VkSamplerCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;ci.minFilter=minLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;
   ci.magFilter=magLinear?VK_FILTER_LINEAR:VK_FILTER_NEAREST;ci.mipmapMode=mip==2?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  ci.unnormalizedCoordinates=normalized?VK_FALSE:VK_TRUE;
   ci.addressModeU=ci.addressModeV=ci.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   if(address) {VkSamplerAddressMode *modes[3]={&ci.addressModeU,&ci.addressModeV,&ci.addressModeW};bool clampBorder=false;
    for(unsigned i=0;i<3;++i)switch(address[i]) {
@@ -824,12 +842,13 @@ public:
   if(!textureShapeAccepted(type,height,usage,depth,levels))throw std::runtime_error("texture dimension/usage");
   if(!levels || levels>mipCount(width,height))throw std::runtime_error("texture mip count");
   if(!limits.extent(width,height,texelBytes(format)) || !limits.volume(width,height,depth,texelBytes(format)))throw std::runtime_error("texture extent/bytes outside device limit");
-  if((usage&~21u) || format==81 || (format==1 && ((usage&4) || !usage)))throw std::runtime_error("unsupported texture usage/sRGB/A8 attachment");
-  usage=(usage&5)?usage&5:(format==1?1:5);
+  if((usage&~23u) || format==81 || (format==1 && ((usage&4) || !usage)))throw std::runtime_error("unsupported texture usage/sRGB/A8 attachment");
+  usage=(usage&7)?usage&7:(format==1?1:5);
   if(format==1 && (usage&4))throw std::runtime_error("A8 attachment");
   VkFormatProperties features{};GetPhysicalDeviceFormatProperties(physical,pixelFormat(format),&features);
   VkFormatFeatureFlags needed=VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
   if(usage&1)needed|=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+  if(usage&2)needed|=VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
   if(usage&4)needed|=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
   if((features.optimalTilingFeatures&needed)!=needed)throw std::runtime_error("texture format features unavailable");
   auto *t=new Texture{};t->width=width;t->height=height;t->depth=depth;t->levels=levels;t->textureType=type;t->format=format;t->vkFormat=pixelFormat(format);
@@ -838,7 +857,7 @@ public:
   try {
    VkImageCreateInfo ii{};ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;ii.imageType=imageTypeFor(type);ii.format=t->vkFormat;
    ii.extent={width,height,depth};ii.mipLevels=levels;ii.arrayLayers=1;ii.samples=VK_SAMPLE_COUNT_1_BIT;ii.tiling=VK_IMAGE_TILING_OPTIMAL;
-   ii.usage=(orderedColorAccess && (usage&4)?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|(usage&4?VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:0)|(usage&1?VK_IMAGE_USAGE_SAMPLED_BIT:0);
+   ii.usage=(orderedColorAccess && (usage&4)?VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT:0)|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|(usage&4?VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:0)|(usage&1?VK_IMAGE_USAGE_SAMPLED_BIT:0)|(usage&2?VK_IMAGE_USAGE_STORAGE_BIT:0);
    if(GetPhysicalDeviceImageFormatProperties2){
     VkPhysicalDeviceImageFormatInfo2 query{};query.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;query.format=ii.format;query.type=ii.imageType;query.tiling=ii.tiling;query.usage=ii.usage;
     VkImageFormatProperties2 supported{};supported.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
@@ -886,13 +905,17 @@ public:
    if(p->stripPipeline)DestroyPipeline(device,p->stripPipeline,nullptr);
    for(auto line:p->linePipelines)if(line)DestroyPipeline(device,line,nullptr);
    for(auto nf:p->nfPipelines)if(nf)DestroyPipeline(device,nf,nullptr);
-   if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);
+   for(auto &cp:p->computePipelines)if(cp.second)DestroyPipeline(device,cp.second,nullptr);
+  if(p->layout)DestroyPipelineLayout(device,p->layout,nullptr);
    if(p->setLayout)DestroyDescriptorSetLayout(device,p->setLayout,nullptr);
    for(auto sampler:p->bakedSamplers)if(sampler)DestroySampler(device,sampler,nullptr);
    for(size_t i=0;i<p->constantBlobs.size();++i){auto *b=p->constantBlobs[i];if(i<p->blobKeys.size()){auto it=blobShare.find(p->blobKeys[i]);if(it!=blobShare.end() && it->second.first==b){if(--it->second.second==0){blobShare.erase(it);destroyUnlocked(b);}continue;}}destroyUnlocked(b);}
    for(auto entry:p->renders)if(auto render=entry.second){clearFrames(nullptr,render);DestroyRenderPass(device,render,nullptr);}
   }
-  if(p->translation)Translator::get().free(p->translation);delete p;
+  auto &tr=Translator::get();
+  if(p->translation)tr.free(p->translation);
+  if(p->computeTranslation && tr.compute_free)tr.compute_free(p->computeTranslation);
+  delete p;
  }
  void destroy(Pipeline *p){std::lock_guard<std::mutex> guard(mutex);destroyPipelineUnlocked(p);}
 
@@ -1033,6 +1056,63 @@ public:
    if(!prewarmWorker){syncCompiles.fetch_add(1);syncCompileNs.fetch_add(uint64_t(missMs*1e6));}
    recordRecipe(identity,v,vn,f,fn,options);}
   return p;
+ }
+ Pipeline *compileComputePipeline(void *v,const char *vn,const CompileOptions &options=CompileOptions{}) {
+  std::unique_lock<std::mutex> guard(mutex);requireLive();
+  auto &tr=Translator::get();if(!tr.compile_compute)throw std::runtime_error("compute translator unavailable");
+  ComputeTranslation translated{};char error[2048]{};
+  auto enabledOptions=options;enabledOptions.orderedColorAccess=orderedColorAccess;enabledOptions.independentBlend=independentBlend;enabledOptions.deviceFeatures=deviceFeatures;
+  guard.unlock();int ok=0;
+  try {ok=tr.compile_compute(v,vn,(void *)gipa,(uint64_t)instance,(uint64_t)physical,&enabledOptions,&translated,error,sizeof(error));}
+  catch(...){guard.lock();if(translated.handle)tr.compute_free(translated.handle);throw;}
+  guard.lock();
+  if(!ok){if(translated.handle)tr.compute_free(translated.handle);throw std::runtime_error(error[0]?error:"compute translation failed");}
+  if(!translated.handle)throw std::runtime_error("compute translation missing handle");
+  try {return createComputePipeline(translated,enabledOptions);}catch(...){if(translated.handle)tr.compute_free(translated.handle);throw;}
+ }
+ Pipeline *createComputePipeline(ComputeTranslation translated,const CompileOptions &options) {
+  auto &tr=Translator::get();auto *p=new Pipeline{};p->options=options;
+  {static std::atomic<uint32_t> serial{0};p->id=++serial;}
+  auto cleanup=[&]{if(translated.handle)tr.compute_free(translated.handle);};
+  try {
+   p->retainedBytes=sizeof(Pipeline)+translated.spirvCount*4;
+   if(!translated.spirv || translated.spirvCount<5 || translated.spirvCount>1048576 || translated.spirv[0]!=0x07230203u)throw std::runtime_error("compute SPIR-V bounds");
+   if(translated.descriptorCount>16)throw std::runtime_error("compute descriptor bound");
+   VkPushConstantRange ranges[2]{};if(translated.rangeCount>2)throw std::runtime_error("compute push range bound");
+   for(unsigned i=0;i<translated.rangeCount;++i)ranges[i]={translated.ranges[i].stages,translated.ranges[i].offset,translated.ranges[i].size};
+   std::vector<VkDescriptorSetLayoutBinding> bindings;
+   for(unsigned i=0;i<translated.descriptorCount;++i){const auto &d=translated.descriptors[i];
+    if(d.binding>=16 || d.set || d.source>1)throw std::runtime_error("compute descriptor layout bound");
+    if(d.type!=VK_DESCRIPTOR_TYPE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && d.type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && d.type!=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && d.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)throw std::runtime_error("compute descriptor type");
+    if(!d.stages)throw std::runtime_error("compute descriptor stages");
+    bindings.push_back({d.binding,(VkDescriptorType)d.type,1,d.stages,nullptr});
+    p->descriptors.push_back(d);
+    if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)p->writesStorage=true;
+   }
+   if(!bindings.empty()){VkDescriptorSetLayoutCreateInfo si{};si.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;si.bindingCount=(uint32_t)bindings.size();si.pBindings=bindings.data();check(CreateDescriptorSetLayout(device,&si,nullptr,&p->setLayout));}
+   VkPipelineLayoutCreateInfo li{};li.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;li.setLayoutCount=p->setLayout?1:0;li.pSetLayouts=&p->setLayout;li.pushConstantRangeCount=translated.rangeCount;li.pPushConstantRanges=ranges;check(CreatePipelineLayout(device,&li,nullptr,&p->layout));
+   p->computeRecipe=translated;p->computeTranslation=translated.handle;translated.handle=nullptr;cleanup();return p;
+  } catch(...){cleanup();destroyPipelineUnlocked(p);throw;}
+ }
+ VkPipeline computePipeline(Pipeline *p,const uint32_t local[3]) {
+  auto &tr=Translator::get();if(!tr.compute_specialization)throw std::runtime_error("compute specialization unavailable");
+  uint8_t data[256]{};uint32_t size=0;if(!tr.compute_specialization(p->computeTranslation,local,0,data,sizeof(data),&size))throw std::runtime_error("compute specialization failed");
+  uint64_t key=1469598103934665603ull;for(uint32_t i=0;i<size;++i)key=(key^data[i])*1099511628211ull;
+  for(auto &entry:p->computePipelines)if(entry.first==key)return entry.second;
+  const auto &t=p->computeRecipe;VkShaderModule module{};
+  VkShaderModuleCreateInfo si{};si.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;si.codeSize=t.spirvCount*4;si.pCode=t.spirv;check(CreateShaderModule(device,&si,nullptr,&module));
+  auto cleanup=[&]{if(module)DestroyShaderModule(device,module,nullptr);};
+  try {
+   if(t.specCount>32 || size>256)throw std::runtime_error("compute specialization bound");
+   std::vector<VkSpecializationMapEntry> entries;for(unsigned i=0;i<t.specCount;++i)entries.push_back({t.specs[i].id,t.specs[i].offset,t.specs[i].size});
+   VkSpecializationInfo spec{(uint32_t)entries.size(),entries.data(),size,data};
+   VkPipelineShaderStageCreateInfo stage{};stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;stage.module=module;stage.pName=t.entry;stage.pSpecializationInfo=&spec;
+   VkComputePipelineCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;ci.stage=stage;ci.layout=p->layout;
+   VkPipeline result{};auto cache=pipelineCache.get();VkResult rc;
+   if(unlockForCompile){mutex.unlock();rc=CreateComputePipelines(device,cache,1,&ci,nullptr,&result);mutex.lock();}else rc=CreateComputePipelines(device,cache,1,&ci,nullptr,&result);
+   if(rc!=VK_SUCCESS){if(result)DestroyPipeline(device,result,nullptr);check(rc);}
+   cleanup();try{p->computePipelines.push_back({key,result});}catch(...){DestroyPipeline(device,result,nullptr);throw;}return result;
+  } catch(...){cleanup();throw;}
  }
  VkRenderPass renderPass(Pipeline *p,const Operation *op,bool nofetch=false) {
   unsigned count=p->options.colorCount;uint32_t key=nofetch?1u<<30:0;
@@ -1857,7 +1937,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
   ArtifactCache::Access artifactAccess(artifactCache);
   Translator::Scope cacheScope(artifactCallbacks,artifactCache.available()?&artifactAccess:nullptr,ArtifactCache::read,ArtifactCache::write,ArtifactCache::outcome,artifactCallbacksVerified,ArtifactCache::readVerified);
   ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
-   bool missing=op.pipeline?(!op.pipeline->translation || !op.pipeline->pipeline || (op.topology==Topology::TriangleStrip && !op.pipeline->stripPipeline)):op.renderDraw;
+   bool missing=op.compute?(!op.pipeline || !op.pipeline->computeTranslation):op.pipeline?(!op.pipeline->translation || !op.pipeline->pipeline || (op.topology==Topology::TriangleStrip && !op.pipeline->stripPipeline)):op.renderDraw;
    if(missing)dropPipelineDraw();return missing;
   }),ops.end());
   ops.erase(std::remove_if(ops.begin(),ops.end(),[](const Operation &op){
@@ -1921,6 +2001,15 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
      if(transferBuffer && (transferBuffer->memory==dst->memory || hostRangesOverlap(transferBuffer->contents,transferBuffer->length,dst->mapped,dst->allocated)))throw std::runtime_error("image/buffer transfer alias");
      if(op.upload && (!op.src || op.from%4 || op.from%pixel || op.from>op.src->length || bytes>op.src->length-op.from))throw std::runtime_error("upload bounds/alignment");
      if(!op.upload && !op.sourceTexture && (!op.dst || op.to%4 || op.to%pixel || op.to>op.dst->length || bytes>op.dst->length-op.to))throw std::runtime_error("readback bounds/alignment");
+    }
+    if(op.compute){
+     if(!op.pipeline || !op.pipeline->computeTranslation)throw std::runtime_error("compute pipeline missing translation");
+     for(unsigned i=0;i<3;++i)if(!op.computeThreads[i])throw std::runtime_error("compute thread bounds");if(op.computeIndirect){if(!op.indirect || op.indirectOffset%4 || op.indirectOffset+sizeof(VkDispatchIndirectCommand)>op.indirect->length)throw std::runtime_error("compute indirect bounds");addBuffer(op.indirect);}else for(unsigned i=0;i<3;++i)if(!op.computeGroups[i])throw std::runtime_error("compute group bounds");
+     for(unsigned i=0;i<resourceSlots;++i)if(op.buffers[1][i].buffer)throw std::runtime_error("compute buffers live in stage 0");
+     for(auto &binding:op.buffers[0])if(binding.buffer){if(binding.length()>binding.buffer->length || binding.offset>binding.length())throw std::runtime_error("compute binding slice bounds");addBuffer(binding.buffer);}
+     for(unsigned i=0;i<resourceSlots;++i){auto *t=op.samples[i];if(t){addTexture(t);generalSamples[n][i]=true;}}
+     if(op.texture || op.clearOnly || op.upload || op.dst || op.src || op.indices || op.generateMips)throw std::runtime_error("compute op shape");
+     continue;
     }
     if(op.pipeline || op.clearOnly){
      if(!op.colorCount || op.colorCount>maxColorAttachments || !op.colorMask || (op.colorMask&~((1u<<op.colorCount)-1)) || (op.pipeline && op.colorCount!=op.pipeline->options.colorCount))throw std::runtime_error("draw/pass color count mismatch");
@@ -2248,8 +2337,8 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    // Bound each descriptor type and sets independently; grow geometrically, retain one pool.
    VkDescriptorPool submitPool{};
    {Measure measure{objectNanos,SubPhase::objects};std::vector<VkDescriptorPoolSize> sizes;uint32_t sets=0;
-    for(size_t i=0;i<ops.size();++i){if(!ops[i].texture || !ops[i].pipeline || !draws[i].descriptorCount)continue;if(sets==4096)throw std::runtime_error("submit descriptor set bound");++sets;
-     for(unsigned j=0;j<draws[i].descriptorCount;++j){auto ty=(VkDescriptorType)draws[i].descriptors[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else {if(it->descriptorCount==65536)throw std::runtime_error("submit descriptor type bound");++it->descriptorCount;}}}
+    for(size_t i=0;i<ops.size();++i){const Descriptor *ds=nullptr;unsigned dc=0;if(ops[i].texture && ops[i].pipeline && draws[i].descriptorCount){ds=draws[i].descriptors;dc=draws[i].descriptorCount;}else if(ops[i].compute && ops[i].pipeline){ds=ops[i].pipeline->computeRecipe.descriptors;dc=ops[i].pipeline->computeRecipe.descriptorCount;}if(!dc)continue;if(sets==4096)throw std::runtime_error("submit descriptor set bound");++sets;
+      for(unsigned j=0;j<dc;++j){auto ty=(VkDescriptorType)ds[j].type;auto it=std::find_if(sizes.begin(),sizes.end(),[&](const VkDescriptorPoolSize &z){return z.type==ty;});if(it==sizes.end())sizes.push_back({ty,1});else {if(it->descriptorCount==65536)throw std::runtime_error("submit descriptor type bound");++it->descriptorCount;}}}
     if(sets>4096)throw std::runtime_error("submit descriptor set bound");
     bool grow=sets>descriptorSets;
     for(auto z:sizes){if(z.descriptorCount>65536)throw std::runtime_error("submit descriptor type bound");auto it=std::find_if(descriptorCapacity.begin(),descriptorCapacity.end(),[&](auto c){return c.type==z.type;});if(it==descriptorCapacity.end() || it->descriptorCount<z.descriptorCount)grow=true;}
@@ -2280,12 +2369,13 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    // Perf bit 4: a shadow is copied from its backing buffer once per submit when nothing in the submit can change that backing
    // (no buffer destination, no storage-buffer/image shader, no written texture overlapping it). The CPU snapshot is applied before submit.
    bool shadowStable=boundaryPerf;
-   if(boundaryPerf)for(size_t n=0;n<ops.size() && shadowStable;++n)if(ops[n].pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto t=draws[n].descriptors[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){shadowStable=false;break;}}
+   if(boundaryPerf)for(size_t n=0;n<ops.size() && shadowStable;++n)if(ops[n].pipeline){const Descriptor *ds=ops[n].compute?ops[n].pipeline->computeRecipe.descriptors:draws[n].descriptors;unsigned dc=ops[n].compute?ops[n].pipeline->computeRecipe.descriptorCount:draws[n].descriptorCount;for(unsigned j=0;j<dc;++j){auto t=ds[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){shadowStable=false;break;}}}
    auto backingStable=[&](Texture *t){
     if(!shadowStable)return false;auto *backing=t->backingBuffer;if(!backing)return false;
     auto hits=[&](Texture *w){return w && (backing->memory==w->memory || hostRangesOverlap(backing->contents,backing->length,w->mapped,w->allocated));};
     for(auto &op:ops){
      if(op.dst && (op.dst==backing || op.dst->memory==backing->memory || hostRangesOverlap(backing->contents,backing->length,op.dst->contents,op.dst->length)))return false;
+
      if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)if(hits(op.color(i).texture))return false;}
      else if(op.texture && (op.upload || op.sourceTexture || op.generateMips) && hits(op.texture))return false;
     }
@@ -2294,7 +2384,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    // Unchanged-backing skip: a linear-texture shadow is re-copied only when a hash of its backing rows differs from the hash at the last recorded copy.
    // Never when this or an earlier submit may write the backing on the GPU (sticky Buffer::gpuWritten); a failed submit restores the hash with the layouts.
    std::unordered_map<Buffer *,bool> backingWrites;std::unordered_map<Texture *,uint64_t> submitHashes;
-   bool anyStorage=false;if(systemTranslationPolicy().shadowHash)for(size_t n=0;n<ops.size() && !anyStorage;++n)if(ops[n].pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto t=draws[n].descriptors[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){anyStorage=true;break;}}
+   bool anyStorage=false;if(systemTranslationPolicy().shadowHash)for(size_t n=0;n<ops.size() && !anyStorage;++n)if(ops[n].pipeline){const Descriptor *ds=ops[n].compute?ops[n].pipeline->computeRecipe.descriptors:draws[n].descriptors;unsigned dc=ops[n].compute?ops[n].pipeline->computeRecipe.descriptorCount:draws[n].descriptorCount;for(unsigned j=0;j<dc;++j){auto t=ds[j].type;if(t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || t==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){anyStorage=true;break;}}}
    auto writesBacking=[&](Buffer *backing){
     auto cached=backingWrites.find(backing);if(cached!=backingWrites.end())return cached->second;
     bool w=anyStorage || backing->gpuWritten;
@@ -2372,6 +2462,24 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
       barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
       pb(VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);t->setDefined(l);
      }
+    }else if(op.compute){
+     auto *p=op.pipeline;VkPipeline pipeline=computePipeline(p,op.computeThreads);
+     CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
+     const auto &t=p->computeRecipe;VkDescriptorSet set{};
+     if(t.descriptorCount){
+      VkDescriptorSetAllocateInfo sai{};sai.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;sai.descriptorPool=submitPool;sai.descriptorSetCount=1;sai.pSetLayouts=&p->setLayout;
+      check(AllocateDescriptorSets(device,&sai,&set));
+      for(unsigned i=0;i<t.descriptorCount;++i){const auto &d=t.descriptors[i];VkWriteDescriptorSet write{};write.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;write.dstSet=set;write.dstBinding=d.binding;write.descriptorCount=1;write.descriptorType=(VkDescriptorType)d.type;VkDescriptorImageInfo image{};VkDescriptorBufferInfo buffer{};
+       if(d.type==VK_DESCRIPTOR_TYPE_SAMPLER){if(d.sampler>=resourceSlots)throw std::runtime_error("compute sampler slot");auto *sam=op.samplers[d.sampler];if(!sam)throw std::runtime_error("compute unbound sampler");image.sampler=sam->sampler;write.pImageInfo=&image;}
+       else if(d.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){if(d.slot>=resourceSlots || !op.samples[d.slot])throw std::runtime_error("compute unbound texture");auto *tex=op.samples[d.slot];auto *sam=d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?(d.sampler<resourceSlots?op.samplers[d.sampler]:nullptr):nullptr;if(d.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !sam)throw std::runtime_error("compute combined sampler missing");image={sam?sam->sampler:VK_NULL_HANDLE,tex->view?tex->view:attachmentView(tex,0),VK_IMAGE_LAYOUT_GENERAL};write.pImageInfo=&image;}
+       else {if(d.slot>=resourceSlots)throw std::runtime_error("compute buffer slot");auto &b=op.buffers[0][d.slot];if(!b.buffer)throw std::runtime_error("compute unbound buffer");uint64_t length=b.length()?b.length():b.buffer->length;if(b.offset>length)throw std::runtime_error("compute buffer offset");buffer={b.buffer->buffer,b.offset,length-b.offset};write.pBufferInfo=&buffer;}
+       UpdateDescriptorSets(device,1,&write,0,nullptr);
+      }
+      CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,p->layout,0,1,&set,0,nullptr);
+     }
+     if(t.pushSize)CmdPushConstants(cmd,p->layout,t.pushStages,t.pushOffset,t.pushSize,t.pushBytes);
+     if(op.computeIndirect)CmdDispatchIndirect(cmd,op.indirect->buffer,op.indirectOffset);else CmdDispatch(cmd,op.computeGroups[0],op.computeGroups[1],op.computeGroups[2]);
+     for(unsigned i=0;i<t.descriptorCount;++i){const auto &d=t.descriptors[i];if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && d.slot<resourceSlots && op.samples[d.slot]){auto *tex=op.samples[d.slot];uint32_t base=op.sampleBase[d.slot];uint32_t count=op.sampleCount[d.slot]?op.sampleCount[d.slot]:tex->levels-base;for(uint32_t l=base;l<base+count && l<tex->levels;++l)tex->setDefined(l);}}
     }else
     if(op.texture && op.pipeline) {
      std::array<Texture *,8> targets{};std::array<uint32_t,8> levels{};VkImageView targetViews[8]{},compactViews[8]{};VkClearValue clears[8]{};unsigned used=0;
@@ -2670,6 +2778,7 @@ uint64_t rtShadowIn=0,rtShadowInSkipped=0,rtShadowOut=0,rtShadowSyncs=0,rtShadow
    for(size_t n=0;n<ops.size();++n){auto &op=ops[n];bufferUse(writes,op.dst);
     if(op.pipeline || op.clearOnly){for(unsigned i=0;i<std::min(op.colorCount,8u);++i)textureUse(writes,op.color(i).texture);}
     else if(op.texture && (op.upload || op.sourceTexture || op.generateMips))textureUse(writes,op.texture);
+    if(op.compute && op.pipeline){const auto &t=op.pipeline->computeRecipe;for(unsigned j=0;j<t.descriptorCount;++j){auto &d=t.descriptors[j];if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER){if(d.slot<resourceSlots)bufferUse(writes,op.buffers[0][d.slot].buffer);}else if(d.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){if(d.slot<resourceSlots)textureUse(writes,op.samples[d.slot]);}}}
     if(op.pipeline)for(unsigned j=0;j<draws[n].descriptorCount;++j){auto &d=draws[n].descriptors[j];if(d.type!=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)continue;
      for(unsigned stage=0;stage<2;++stage)if((d.stages&(stage?16u:1u)) && (d.binding>=16 || !(op.pipeline->readOnlyStorage[stage]&(1u<<d.binding)))){
       if(d.source==1){if(d.slot<op.pipeline->constantBlobs.size())bufferUse(writes,op.pipeline->constantBlobs[d.slot]);}else if(!d.source && d.slot<resourceSlots)bufferUse(writes,op.buffers[stage][d.slot].buffer);

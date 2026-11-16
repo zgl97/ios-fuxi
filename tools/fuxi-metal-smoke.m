@@ -16,6 +16,13 @@
 /* Private libsystem_kernel call (kern_memorystatus.h). The smoke runs in place of
  * a daemon whose launchd jetsam limit is too small for a cold shader translation. */
 extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t size);
+/* Pipeline cache persistence probe used by the stage 4 stress block. */
+@protocol FuxiPipelineCacheProbe <NSObject>
+- (unsigned long long)fuxiPipelineCacheBytes;
+- (unsigned long long)fuxiPipelineCacheCheckpoint;
+- (unsigned long long)fuxiPipelineCacheSaveResult;
+- (unsigned long long)fuxiPipelineCacheSaveBytes;
+@end
 /* SET_JETSAM_TASK_LIMIT (6) is CONFIG_JETSAM-only and returns EINVAL on Fuxi. */
 #define FUXI_MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES 7
 #define FUXI_MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES 8
@@ -124,6 +131,192 @@ static void pipeline(id<MTLDevice>device,id<MTLCommandQueue>q) {
  for(unsigned i=0;i<6;++i)if(pixels[(samples[i][1]*256+samples[i][0])*4+2]!=samples[i][2])fail("inside/outside sample %u",i);
  if(red<8064 || red>8320 || red+black!=65536)fail("pixel counts red %u black %u",red,black);
  printf("FUXI MTL: stage 4 pipeline PASS BGRA8 256x256 inside/outside 6 red %u clear %u + sentinel edges\n",red,black);
+ // M8 compute: kernel in the main metallib; raw AIR bitcode remains a local fallback.
+ error=nil;id<MTLLibrary> computeLibrary=nil;id<MTLFunction> kernel=[library newFunctionWithName:@"fuxi_compute"];
+ if(!kernel){error=nil;NSURL *computeURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute.bc"];computeLibrary=[device newLibraryWithURL:computeURL error:&error];if(!computeLibrary || error)fail("compute library %s",error.description.UTF8String);kernel=[computeLibrary newFunctionWithName:@"fuxi_compute"];}
+ if(!kernel || kernel.functionType!=MTLFunctionTypeKernel)fail("compute kernel function");
+ id<MTLComputePipelineState> cp=[device newComputePipelineStateWithFunction:kernel error:&error];
+ if(!cp || error)fail("compute pipeline %s",error.description.UTF8String);
+ if(cp.maxTotalThreadsPerThreadgroup<64)fail("compute max threads %lu",(unsigned long)cp.maxTotalThreadsPerThreadgroup);
+ id<MTLBuffer> values=[device newBufferWithLength:65536+512 options:MTLResourceStorageModeShared];
+ if(!values)fail("compute buffer allocation");memset(values.contents,0x39,values.length);
+ id<MTLCommandBuffer> cc=q.commandBuffer;if(!cc)fail("nil compute command buffer");
+ id<MTLComputeCommandEncoder> ce=[cc computeCommandEncoder];if(!ce)fail("nil compute encoder");
+ [ce setComputePipelineState:cp];[ce setBuffer:values offset:0 atIndex:0];
+ [ce dispatchThreads:MTLSizeMake(16384,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+ [ce endEncoding];finish(cc);
+ const uint32_t *out=(const uint32_t *)values.contents;
+ for(unsigned i=0;i<16384;++i)if(out[i]!=i*3u+7u)fail("compute value %u got %u",i,out[i]);
+ const uint8_t *tail=(const uint8_t *)values.contents+65536;
+ for(unsigned i=0;i<512;++i)if(tail[i]!=0x39)fail("compute sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute PASS kernel dispatchThreads 16384 threads + sentinel edges\n");
+ // M8 compute: indirect dispatch via MTLDispatchThreadgroupsIndirectArguments (groups 256,1,1; threads 64,1,1).
+ id<MTLBuffer> indirect=[device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+ if(!indirect)fail("compute indirect buffer allocation");uint32_t *ind=(uint32_t *)indirect.contents;ind[0]=256;ind[1]=1;ind[2]=1;
+ memset(values.contents,0x39,values.length);
+ id<MTLCommandBuffer> ic=q.commandBuffer;if(!ic)fail("nil compute indirect command buffer");
+ id<MTLComputeCommandEncoder> ie=[ic computeCommandEncoder];if(!ie)fail("nil compute indirect encoder");
+ [ie setComputePipelineState:cp];[ie setBuffer:values offset:0 atIndex:0];
+ [ie dispatchThreadgroupsWithIndirectBuffer:indirect indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(64,1,1)];[ie endEncoding];finish(ic);
+ for(unsigned i=0;i<16384;++i)if(out[i]!=i*3u+7u)fail("compute indirect value %u got %u",i,out[i]);
+ for(unsigned i=0;i<512;++i)if(tail[i]!=0x39)fail("compute indirect sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute indirect PASS 256 groups x 64 threads + sentinel edges\n");
+ [indirect release];
+ // M8 compute: static threadgroup memory and barrier.
+ error=nil;id<MTLLibrary> threadgroupLibrary=nil;id<MTLFunction> threadgroupKernel=[library newFunctionWithName:@"fuxi_compute_threadgroup"];
+ if(!threadgroupKernel){error=nil;NSURL *threadgroupURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute-threadgroup.bc"];threadgroupLibrary=[device newLibraryWithURL:threadgroupURL error:&error];if(!threadgroupLibrary || error)fail("compute threadgroup library %s",error.description.UTF8String);threadgroupKernel=[threadgroupLibrary newFunctionWithName:@"fuxi_compute_threadgroup"];}
+ if(!threadgroupKernel || threadgroupKernel.functionType!=MTLFunctionTypeKernel)fail("compute threadgroup kernel function");
+ id<MTLComputePipelineState> threadgroupPipeline=[device newComputePipelineStateWithFunction:threadgroupKernel error:&error];
+ if(!threadgroupPipeline || error)fail("compute threadgroup pipeline %s",error.description.UTF8String);
+ if(threadgroupPipeline.staticThreadgroupMemoryLength<256)fail("compute threadgroup static length %lu",(unsigned long)threadgroupPipeline.staticThreadgroupMemoryLength);
+ memset(values.contents,0x39,values.length);
+ id<MTLCommandBuffer> gc=q.commandBuffer;if(!gc)fail("nil compute threadgroup command buffer");
+ id<MTLComputeCommandEncoder> ge=[gc computeCommandEncoder];if(!ge)fail("nil compute threadgroup encoder");
+ [ge setComputePipelineState:threadgroupPipeline];[ge setBuffer:values offset:0 atIndex:0];
+ [ge dispatchThreadgroups:MTLSizeMake(256,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];[ge endEncoding];finish(gc);
+ for(unsigned i=0;i<16384;++i){unsigned lane=i&63u;uint32_t want=(((i-lane)+(63u-lane))*3u)+7u;if(out[i]!=want)fail("compute threadgroup value %u got %u want %u",i,out[i],want);}
+ for(unsigned i=0;i<512;++i)if(tail[i]!=0x39)fail("compute threadgroup sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute threadgroup PASS 256 groups x 64 threads barrier + sentinel edges\n");
+ [threadgroupPipeline release];[threadgroupKernel release];[threadgroupLibrary release];
+ // M8 compute: storage image write, then blit to a shared buffer for CPU verification.
+ error=nil;id<MTLLibrary> textureLibrary=nil;id<MTLFunction> textureKernel=[library newFunctionWithName:@"fuxi_compute_texture"];
+ if(!textureKernel){error=nil;NSURL *textureURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute-texture.bc"];textureLibrary=[device newLibraryWithURL:textureURL error:&error];if(!textureLibrary || error)fail("compute texture library %s",error.description.UTF8String);textureKernel=[textureLibrary newFunctionWithName:@"fuxi_compute_texture"];}
+ if(!textureKernel || textureKernel.functionType!=MTLFunctionTypeKernel)fail("compute texture kernel function");
+ id<MTLComputePipelineState> texturePipeline=[device newComputePipelineStateWithFunction:textureKernel error:&error];
+ if(!texturePipeline || error)fail("compute texture pipeline %s",error.description.UTF8String);
+ MTLTextureDescriptor *ctd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
+ ctd.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;ctd.storageMode=MTLStorageModePrivate;
+ id<MTLTexture> storageTexture=[device newTextureWithDescriptor:ctd];
+ id<MTLBuffer> textureReadback=[device newBufferWithLength:64*64*4+256 options:MTLResourceStorageModeShared];
+ if(!storageTexture || !textureReadback)fail("compute texture allocation");memset(textureReadback.contents,0x39,textureReadback.length);
+ id<MTLCommandBuffer> tc=q.commandBuffer;if(!tc)fail("nil compute texture command buffer");
+ id<MTLComputeCommandEncoder> te=[tc computeCommandEncoder];if(!te)fail("nil compute texture encoder");
+ [te setComputePipelineState:texturePipeline];[te setTexture:storageTexture atIndex:0];
+ [te dispatchThreads:MTLSizeMake(64,64,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[te endEncoding];
+ id<MTLBlitCommandEncoder> tb=tc.blitCommandEncoder;if(!tb)fail("nil compute texture readback encoder");
+ [tb copyFromTexture:storageTexture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(64,64,1)
+  toBuffer:textureReadback destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:16384];
+ [tb endEncoding];finish(tc);
+ const uint8_t *tex=(const uint8_t *)textureReadback.contents;
+ for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x){const uint8_t *px=tex+(y*64+x)*4;if(px[0]!=x || px[1]!=y || px[2]!=0 || px[3]!=255)fail("compute texture pixel %u,%u = %u,%u,%u,%u",x,y,px[0],px[1],px[2],px[3]);}
+ const uint8_t *ttail=(const uint8_t *)textureReadback.contents+16384;
+ for(unsigned i=0;i<256;++i)if(ttail[i]!=0x39)fail("compute texture sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute texture PASS RGBA8 64x64 write + sentinel edges\n");
+ [textureReadback release];[storageTexture release];[texturePipeline release];[textureKernel release];[textureLibrary release];
+ // M8 compute: sampled texture + runtime sampler, linear filtering with repeat addressing.
+ error=nil;id<MTLLibrary> sampleLibrary=nil;id<MTLFunction> sampleKernel=[library newFunctionWithName:@"fuxi_compute_sample"];
+ if(!sampleKernel){error=nil;NSURL *sampleURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute-sample.bc"];sampleLibrary=[device newLibraryWithURL:sampleURL error:&error];if(!sampleLibrary || error)fail("compute sample library %s",error.description.UTF8String);sampleKernel=[sampleLibrary newFunctionWithName:@"fuxi_compute_sample"];}
+ if(!sampleKernel || sampleKernel.functionType!=MTLFunctionTypeKernel)fail("compute sample kernel function");
+ id<MTLComputePipelineState> samplePipeline=[device newComputePipelineStateWithFunction:sampleKernel error:&error];
+ if(!samplePipeline || error)fail("compute sample pipeline %s",error.description.UTF8String);
+ MTLTextureDescriptor *ssd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+ ssd.usage=MTLTextureUsageShaderRead;ssd.storageMode=MTLStorageModeShared;
+ id<MTLTexture> sampleSource=[device newTextureWithDescriptor:ssd];
+ MTLTextureDescriptor *std=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+ std.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;std.storageMode=MTLStorageModePrivate;
+ id<MTLTexture> sampleTarget=[device newTextureWithDescriptor:std];
+ if(!sampleSource || !sampleTarget)fail("compute sample texture allocation");
+ uint8_t samplePattern[8*8*4];
+ for(unsigned y=0;y<8;++y)for(unsigned x=0;x<8;++x){uint8_t *px=samplePattern+(y*8+x)*4;px[0]=(uint8_t)(x*32);px[1]=(uint8_t)(y*32);px[2]=64;px[3]=255;}
+ [sampleSource replaceRegion:MTLRegionMake2D(0,0,8,8) mipmapLevel:0 withBytes:samplePattern bytesPerRow:8*4];
+ MTLSamplerDescriptor *smd=[MTLSamplerDescriptor new];smd.minFilter=MTLSamplerMinMagFilterLinear;smd.magFilter=MTLSamplerMinMagFilterLinear;smd.sAddressMode=MTLSamplerAddressModeRepeat;smd.tAddressMode=MTLSamplerAddressModeRepeat;
+ id<MTLSamplerState> sampleState=[device newSamplerStateWithDescriptor:smd];
+ id<MTLBuffer> sampleReadback=[device newBufferWithLength:8*8*4+256 options:MTLResourceStorageModeShared];
+ if(!sampleState || !sampleReadback)fail("compute sample sampler/readback allocation");memset(sampleReadback.contents,0x39,sampleReadback.length);
+ id<MTLCommandBuffer> sc=q.commandBuffer;if(!sc)fail("nil compute sample command buffer");
+ id<MTLComputeCommandEncoder> se=[sc computeCommandEncoder];if(!se)fail("nil compute sample encoder");
+ [se setComputePipelineState:samplePipeline];[se setTexture:sampleSource atIndex:0];[se setSamplerState:sampleState atIndex:0];[se setTexture:sampleTarget atIndex:1];
+ [se dispatchThreads:MTLSizeMake(8,8,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[se endEncoding];
+ id<MTLBlitCommandEncoder> sb=sc.blitCommandEncoder;if(!sb)fail("nil compute sample readback encoder");
+ [sb copyFromTexture:sampleTarget sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1)
+  toBuffer:sampleReadback destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
+ [sb endEncoding];finish(sc);
+ const uint8_t *samplePixels=(const uint8_t *)sampleReadback.contents;
+ for(unsigned y=0;y<8;++y)for(unsigned x=0;x<8;++x){
+  uint32_t nx=(x+1)&7u,ny=(y+1)&7u;
+  uint32_t wantR=(x*32u+nx*32u)/2u,wantG=(y*32u+ny*32u)/2u;
+  const uint8_t *px=samplePixels+(y*8+x)*4;
+  if(px[0]!=wantR || px[1]!=wantG || px[2]!=64 || px[3]!=255)fail("compute sample pixel %u,%u = %u,%u,%u,%u want %u,%u,64,255",x,y,px[0],px[1],px[2],px[3],wantR,wantG);
+ }
+ const uint8_t *stail=(const uint8_t *)sampleReadback.contents+256;
+ for(unsigned i=0;i<256;++i)if(stail[i]!=0x39)fail("compute sample sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute sample PASS RGBA8 8x8 linear repeat + sentinel edges\n");
+ [sampleReadback release];[sampleState release];[smd release];[sampleTarget release];[sampleSource release];[samplePipeline release];[sampleKernel release];[sampleLibrary release];
+ // M8 compute: tile pipeline with static threadgroup memory and a barrier.
+ error=nil;id<MTLLibrary> tileLibrary=nil;id<MTLFunction> tileKernel=[library newFunctionWithName:@"fuxi_tile_memory"];
+ if(!tileKernel){error=nil;NSURL *tileURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute-tile.bc"];tileLibrary=[device newLibraryWithURL:tileURL error:&error];if(!tileLibrary || error)fail("tile library %s",error.description.UTF8String);tileKernel=[tileLibrary newFunctionWithName:@"fuxi_tile_memory"];}
+ if(!tileKernel || tileKernel.functionType!=MTLFunctionTypeKernel)fail("tile kernel function");
+ MTLTileRenderPipelineDescriptor *tpd=[MTLTileRenderPipelineDescriptor new];tpd.tileFunction=tileKernel;tpd.threadgroupSizeMatchesTileSize=YES;tpd.maxTotalThreadsPerThreadgroup=256;tpd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
+ id<MTLRenderPipelineState> tilePipeline=[device newRenderPipelineStateWithTileDescriptor:tpd options:MTLPipelineOptionNone reflection:nil error:&error];
+ if(!tilePipeline || error)fail("tile pipeline %s",error.description.UTF8String);
+ if(tilePipeline.maxTotalThreadsPerThreadgroup<256)fail("tile max threads %lu",(unsigned long)tilePipeline.maxTotalThreadsPerThreadgroup);
+ MTLTextureDescriptor *ttd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];ttd.usage=MTLTextureUsageRenderTarget;ttd.storageMode=MTLStorageModePrivate;
+ id<MTLTexture> tileTarget=[device newTextureWithDescriptor:ttd];if(!tileTarget)fail("tile target allocation");
+ memset(values.contents,0x39,values.length);
+ MTLRenderPassDescriptor *rpd=[MTLRenderPassDescriptor renderPassDescriptor];rpd.colorAttachments[0].texture=tileTarget;rpd.colorAttachments[0].loadAction=MTLLoadActionClear;rpd.colorAttachments[0].storeAction=MTLStoreActionStore;rpd.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,1);rpd.tileWidth=16;rpd.tileHeight=16;rpd.threadgroupMemoryLength=1024;
+ id<MTLCommandBuffer> tileCommand=q.commandBuffer;if(!tileCommand)fail("nil tile command buffer");
+ id<MTLRenderCommandEncoder> tileEncoder=[tileCommand renderCommandEncoderWithDescriptor:rpd];if(!tileEncoder)fail("nil tile encoder");
+ [tileEncoder setRenderPipelineState:tilePipeline];[tileEncoder setTileBuffer:values offset:0 atIndex:0];[tileEncoder setThreadgroupMemoryLength:1024 offset:0 atIndex:0];[tileEncoder dispatchThreadsPerTile:MTLSizeMake(16,16,1)];[tileEncoder endEncoding];finish(tileCommand);
+ const uint32_t *tileOut=(const uint32_t *)values.contents;
+ for(unsigned gy=0;gy<4;++gy)for(unsigned gx=0;gx<4;++gx)for(unsigned tid=0;tid<256;++tid){uint32_t want=gx*1000u+gy*100u+(255u-tid);unsigned at=(gy*4u+gx)*256u+tid;if(tileOut[at]!=want)fail("tile value %u,%u,%u got %u want %u",gx,gy,tid,tileOut[at],want);}
+ const uint8_t *tileTail=(const uint8_t *)values.contents+16384;
+ for(unsigned i=0;i<256;++i)if(tileTail[i]!=0x39)fail("tile sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute tile PASS 4x4 tiles x 256 threads barrier + static 1024B + sentinel edges\n");
+ [tileTarget release];[tilePipeline release];[tpd release];[tileKernel release];[tileLibrary release];
+ // M8 compute: explicit assert imageblock 8x8 cells + barrier.
+ error=nil;id<MTLLibrary> imageblockLibrary=nil;id<MTLFunction> imageblockKernel=[library newFunctionWithName:@"fuxi_compute_imageblock"];
+ if(!imageblockKernel){error=nil;NSURL *imageblockURL=[NSURL fileURLWithPath:@"/usr/local/share/fuxi/metal-compute-imageblock.bc"];imageblockLibrary=[device newLibraryWithURL:imageblockURL error:&error];if(!imageblockLibrary || error)fail("imageblock library %s",error.description.UTF8String);imageblockKernel=[imageblockLibrary newFunctionWithName:@"fuxi_compute_imageblock"];}
+ if(!imageblockKernel || imageblockKernel.functionType!=MTLFunctionTypeKernel)fail("imageblock kernel function");
+ id<MTLComputePipelineState> imageblockPipeline=[device newComputePipelineStateWithFunction:imageblockKernel error:&error];
+ if(!imageblockPipeline || error)fail("imageblock pipeline %s",error.description.UTF8String);
+ if(imageblockPipeline.maxTotalThreadsPerThreadgroup<64)fail("imageblock max threads %lu",(unsigned long)imageblockPipeline.maxTotalThreadsPerThreadgroup);
+ id<MTLBuffer> imageblockValues=[device newBufferWithLength:64*16+256 options:MTLResourceStorageModeShared];
+ if(!imageblockValues)fail("imageblock buffer allocation");memset(imageblockValues.contents,0x39,imageblockValues.length);
+ id<MTLCommandBuffer> imageblockCommand=q.commandBuffer;if(!imageblockCommand)fail("nil imageblock command buffer");
+ id<MTLComputeCommandEncoder> imageblockEncoder=[imageblockCommand computeCommandEncoder];if(!imageblockEncoder)fail("nil imageblock encoder");
+ [imageblockEncoder setComputePipelineState:imageblockPipeline];[imageblockEncoder setImageblockWidth:8 height:8];[imageblockEncoder setBuffer:imageblockValues offset:0 atIndex:0];[imageblockEncoder dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[imageblockEncoder endEncoding];finish(imageblockCommand);
+ const uint32_t *imageblockOut=(const uint32_t *)imageblockValues.contents;
+ for(unsigned i=0;i<64;++i){if(imageblockOut[i*4]!=63u-i || imageblockOut[i*4+1]!=i || imageblockOut[i*4+2] || imageblockOut[i*4+3])fail("imageblock value %u got %u,%u,%u,%u",i,imageblockOut[i*4],imageblockOut[i*4+1],imageblockOut[i*4+2],imageblockOut[i*4+3]);}
+ const uint8_t *imageblockTail=(const uint8_t *)imageblockValues.contents+1024;
+ for(unsigned i=0;i<256;++i)if(imageblockTail[i]!=0x39)fail("imageblock sentinel %u",i);
+ printf("FUXI MTL: stage 4 compute imageblock PASS 8x8 cells x 64 threads barrier + sentinel edges\n");
+ [imageblockValues release];[imageblockPipeline release];[imageblockKernel release];[imageblockLibrary release];
+ // M8 compute: pipeline-cache stress, specialization churn, and explicit persistence checkpoint.
+ NSDate *cacheStressBegan=[NSDate date];
+ static const MTLBlendFactor cacheSrc[8]={MTLBlendFactorZero,MTLBlendFactorOne,MTLBlendFactorSourceColor,MTLBlendFactorOneMinusSourceColor,MTLBlendFactorSourceAlpha,MTLBlendFactorOneMinusSourceAlpha,MTLBlendFactorDestinationColor,MTLBlendFactorOneMinusDestinationColor};
+ static const MTLBlendFactor cacheDst[8]={MTLBlendFactorOne,MTLBlendFactorZero,MTLBlendFactorOneMinusSourceAlpha,MTLBlendFactorSourceAlpha,MTLBlendFactorOneMinusSourceColor,MTLBlendFactorSourceColor,MTLBlendFactorOneMinusDestinationColor,MTLBlendFactorDestinationColor};
+ static const uint32_t cacheMasks[4]={1,2,4,8};unsigned cacheRenderCount=0;
+ for(unsigned blend=0;blend<8;++blend)for(unsigned mi=0;mi<4;++mi)for(unsigned format=0;format<2;++format) {
+  MTLRenderPipelineDescriptor *dp=[MTLRenderPipelineDescriptor new];dp.vertexFunction=v;dp.fragmentFunction=f;
+  MTLRenderPipelineColorAttachmentDescriptor *ca=dp.colorAttachments[0];
+  ca.pixelFormat=format?MTLPixelFormatRGBA8Unorm:MTLPixelFormatBGRA8Unorm;ca.writeMask=cacheMasks[mi];
+  ca.blendingEnabled=YES;ca.sourceRGBBlendFactor=cacheSrc[blend];ca.destinationRGBBlendFactor=cacheDst[blend];
+  ca.sourceAlphaBlendFactor=MTLBlendFactorOne;ca.destinationAlphaBlendFactor=MTLBlendFactorOneMinusSourceAlpha;
+  error=nil;id<MTLRenderPipelineState> stressPipeline=[device newRenderPipelineStateWithDescriptor:dp error:&error];
+  if(!stressPipeline || error)fail("cache stress render pipeline %u blend=%u mask=%u format=%u: %s",cacheRenderCount,blend,mi,format,error.description.UTF8String);
+  [stressPipeline release];[dp release];++cacheRenderCount;
+ }
+ for(unsigned i=0;i<16;++i){error=nil;id<MTLComputePipelineState> duplicate=[device newComputePipelineStateWithFunction:kernel error:&error];if(!duplicate || error)fail("cache stress compute duplicate %u: %s",i,error.description.UTF8String);[duplicate release];}
+ static const uint32_t cacheLocals[]={1,2,4,8,16,32,64,128,256,512,1024};
+ for(unsigned i=0;i<sizeof(cacheLocals)/sizeof(cacheLocals[0]);++i){
+  uint32_t local=cacheLocals[i];memset(values.contents,0x39,values.length);
+  id<MTLCommandBuffer> lc=q.commandBuffer;if(!lc)fail("nil cache stress compute command buffer");
+  id<MTLComputeCommandEncoder> le=[lc computeCommandEncoder];if(!le)fail("nil cache stress compute encoder");
+  [le setComputePipelineState:cp];[le setBuffer:values offset:0 atIndex:0];
+  [le dispatchThreadgroups:MTLSizeMake(16384u/local,1,1) threadsPerThreadgroup:MTLSizeMake(local,1,1)];[le endEncoding];finish(lc);
+  for(unsigned j=0;j<16384;++j)if(out[j]!=j*3u+7u)fail("cache stress value local=%u index=%u got %u",local,j,out[j]);
+  for(unsigned j=0;j<512;++j)if(tail[j]!=0x39)fail("cache stress sentinel local=%u index=%u",local,j);
+ }
+ uint64_t cacheBytesBefore=[(id<FuxiPipelineCacheProbe>)device fuxiPipelineCacheBytes];
+ uint64_t cacheCheckpoint=[(id<FuxiPipelineCacheProbe>)device fuxiPipelineCacheCheckpoint];
+ uint64_t cacheBytesAfter=[(id<FuxiPipelineCacheProbe>)device fuxiPipelineCacheBytes];
+ uint64_t cacheSaveResult=[(id<FuxiPipelineCacheProbe>)device fuxiPipelineCacheSaveResult];
+ uint64_t cacheSaveBytes=[(id<FuxiPipelineCacheProbe>)device fuxiPipelineCacheSaveBytes];
+ double cacheStressMs=-[cacheStressBegan timeIntervalSinceNow]*1000.0;
+ if(cacheCheckpoint!=1)fail("pipeline cache checkpoint result %llu save=%llu",(unsigned long long)cacheCheckpoint,(unsigned long long)cacheSaveResult);
+ if(cacheSaveResult!=1 || cacheSaveBytes<32)fail("pipeline cache save result %llu bytes %llu",(unsigned long long)cacheSaveResult,(unsigned long long)cacheSaveBytes);
+ printf("FUXI MTL: stage 4 pipeline cache stress PASS render=%u compute=16 local=%u ms=%.1f bytes=%llu->%llu save=%llu\n",cacheRenderCount,(unsigned)(sizeof(cacheLocals)/sizeof(cacheLocals[0])),cacheStressMs,(unsigned long long)cacheBytesBefore,(unsigned long long)cacheBytesAfter,(unsigned long long)cacheSaveBytes);
+ [values release];[cp release];[kernel release];[computeLibrary release];
  [b release];[t release];[p release];[pd release];[v release];[f release];[library release];[dataLibrary release];
 }
 static IOSurfaceRef surface(void) {

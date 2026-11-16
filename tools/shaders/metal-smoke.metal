@@ -62,3 +62,33 @@ fragment float4 fuxi_four_fragment(FuxiM7Varying v [[stage_in]],
  sampler s0 [[sampler(0)]],sampler s1 [[sampler(1)]],sampler s2 [[sampler(2)]],sampler s3 [[sampler(3)]]) {
  return (a.sample(s0,v.uv)+b.sample(s1,v.uv)+c.sample(s2,v.uv)+d.sample(s3,v.uv))*0.25f;
 }
+// M8 compute coverage: deterministic storage-buffer write, verified by the smoke.
+kernel void fuxi_compute(device uint *values [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+ values[id] = id * 3u + 7u;
+}
+// M8 compute: storage-texture write coverage, verified by the smoke.
+kernel void fuxi_compute_texture(texture2d<float, access::write> out [[texture(0)]], uint2 gid [[thread_position_in_grid]]) {
+ out.write(float4(float(gid.x) / 255.0f, float(gid.y) / 255.0f, 0.0f, 1.0f), gid);
+}
+// M8 compute: static threadgroup memory and barrier coverage, verified by the smoke.
+kernel void fuxi_compute_threadgroup(device uint *values [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+ threadgroup uint scratch[64];
+ uint lane = id & 63u;
+ scratch[lane] = id * 3u + 7u;
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ values[id] = scratch[63u - lane];
+}
+// M8 compute: sampled texture + runtime sampler, verified by the smoke.
+kernel void fuxi_compute_sample(texture2d<float, access::sample> src [[texture(0)]],
+ sampler samp [[sampler(0)]], texture2d<float, access::write> out [[texture(1)]],
+ uint2 gid [[thread_position_in_grid]]) {
+ float2 uv = (float2(gid.x, gid.y) + 1.0f) / 8.0f;
+ out.write(src.sample(samp, uv), gid);
+}
+// M8 compute: tile pipeline with static threadgroup memory and a barrier.
+kernel void fuxi_tile_memory(device uint *out [[buffer(0)]], uint tid [[thread_index_in_threadgroup]], uint2 gid [[threadgroup_position_in_grid]]) {
+ threadgroup uint scratch[256];
+ scratch[tid] = gid.x * 1000u + gid.y * 100u + tid;
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ out[(gid.y * 4u + gid.x) * 256u + tid] = scratch[255u - tid];
+}
