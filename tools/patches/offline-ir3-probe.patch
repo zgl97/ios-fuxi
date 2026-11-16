@@ -1,0 +1,30 @@
+diff --git a/meson.options b/meson.options
+index 678bc67..fc7e9cb 100644
+--- a/meson.options
++++ b/meson.options
+@@ -899,3 +899,7 @@ option(
+   value : false,
+   description : 'Build panfrost Rust components.'
+ )
++
++option('offline-ir3-probe', type : 'string', value : '',
++       description : 'C source for an offline ir3 compiler probe (SPIR-V to A7xx machine code)')
+diff --git a/src/freedreno/ir3/meson.build b/src/freedreno/ir3/meson.build
+index c6258e5..ab6a9c1 100644
+--- a/src/freedreno/ir3/meson.build
++++ b/src/freedreno/ir3/meson.build
+@@ -173,3 +173,16 @@ test('ir3_delay_test',
+   ),
+   suite: ['freedreno'],
+ )
++
++if get_option('offline-ir3-probe') != ''
++  executable(
++    'ir3_offline_probe',
++    get_option('offline-ir3-probe'),
++    link_with : libfreedreno_ir3,
++    dependencies : [idep_libir3decode, idep_mesautil, idep_nir, idep_vtn],
++    include_directories : [inc_freedreno, inc_include, inc_src, inc_spirv],
++    build_by_default : false,
++  )
++endif
